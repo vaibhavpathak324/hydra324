@@ -256,7 +256,9 @@ def drafts(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         text = (
             "<b>Draft status</b>\n\n"
             f"Drafts written, waiting to send: <b>{len(armed)}</b>\n\n"
-            f"<b>Draft message:</b>\n{preview}{extra}"
+            f"<b>Draft message:</b>\n{preview}{extra}\n\n"
+            "<i>Write drafts resumes — people who already have a draft are skipped. "
+            "It starts over only after Send all drafts or Clear drafts.</i>"
         )
     else:
         text = (

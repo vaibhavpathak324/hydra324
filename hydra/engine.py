@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from telethon import TelegramClient
 from telethon.errors import (
@@ -714,8 +714,12 @@ class HydraEngine:
         job: Job,
         label: str,
         user_ids: list[int],
+        commit: Optional[Callable[[list[tuple[str, Any]]], None]] = None,
     ) -> list[tuple[str, Any]]:
-        """Issue many TL requests in MTProto containers instead of a slow serial loop."""
+        """Issue many TL requests in MTProto containers instead of a slow serial loop.
+
+        `commit`, if given, is called with the live results list after every
+        container so callers can persist progress mid-job (crash-safe)."""
         client = self._need()
         results: list[tuple[str, Any]] = [("pending", None)] * len(requests)
 
@@ -838,6 +842,11 @@ class HydraEngine:
                 break
             job.done = min(start + len(chunk), len(requests))
             self.emit("job", job=job.as_dict())
+            if commit:
+                try:
+                    commit(results)
+                except Exception:
+                    pass
             if start + BURST < len(requests):
                 await asyncio.sleep(BURST_PACE)
 
@@ -855,6 +864,11 @@ class HydraEngine:
             job.detail = f"{aborted} ({skipped} skipped)"
             self.note("warn", job.detail)
         self.emit("job", job=job.as_dict())
+        if commit:
+            try:
+                commit(results)
+            except Exception:
+                pass
         return results
 
     def _targets_from_people(
@@ -905,17 +919,60 @@ class HydraEngine:
         async with self._job_lock:
             targets, already_sent = self._targets_from_people(people, message, chat_id)
             self.merge_people(people)
+
+            # Resume: anyone who already has a draft written is skipped, so a
+            # stopped run continues where it stopped. The armed list only
+            # empties via Send all drafts (sent) or Clear drafts.
+            armed_ids = {a.user_id for a in self.armed}
+            target_ids = {t.user_id for t in targets}
+            have_draft = sum(1 for t in targets if t.user_id in armed_ids)
+            stale_msg = sum(
+                1
+                for a in self.armed
+                if a.user_id in target_ids and a.message.strip() != message.strip()
+            )
+            base_armed = [a for a in self.armed if a.user_id not in target_ids]
+            targets = [t for t in targets if t.user_id not in armed_ids]
+            if have_draft:
+                self.note(
+                    "ok",
+                    f"{have_draft} draft(s) already written — continuing from where you stopped.",
+                )
+                if stale_msg:
+                    self.note(
+                        "warn",
+                        f"{stale_msg} armed draft(s) keep their earlier text — "
+                        "Clear drafts to rewrite everyone.",
+                    )
+            if not targets:
+                job = Job(id=f"arm-{int(time.time())}", kind="arm", total=have_draft)
+                job.status = "done"
+                job.ok = have_draft
+                job.detail = f"Nothing new to write — all {have_draft} selected people already have drafts."
+                self.emit("job", job=job.as_dict())
+                self.emit("status", **self.snapshot())
+                self.note("ok", job.detail)
+                return {"job": job.as_dict(), "armed": len(self.armed)}
+
             job = Job(id=f"arm-{int(time.time())}", kind="arm", total=len(targets))
             self.job = job
             self.emit("job", job=job.as_dict())
-            self.note("ok", f"Arming {len(targets)} drafts in one burst sequence.")
+            self.note("ok", f"Writing {len(targets)} drafts ({have_draft} already done).")
 
             requests = [
                 SaveDraftRequest(peer=self._peer(t), message=t.message, no_webpage=True)
                 for t in targets
             ]
+
+            def commit(results: list[tuple[str, Any]]) -> None:
+                # Persist after every container: a restart/cancel mid-job
+                # never loses the drafts already written.
+                written = [t for t, (s, _) in zip(targets, results) if s == "ok"]
+                self.armed = base_armed + written
+                self._persist_armed()
+
             results = await self._burst(
-                requests, job, "arm drafts", [t.user_id for t in targets]
+                requests, job, "arm drafts", [t.user_id for t in targets], commit=commit
             )
 
             armed: list[ArmedTarget] = []
@@ -923,15 +980,19 @@ class HydraEngine:
                 if status == "ok":
                     armed.append(t)
             # Replace previous arm for these users, keep others.
-            keep_ids = {t.user_id for t in armed}
-            self.armed = [a for a in self.armed if a.user_id not in keep_ids] + armed
+            self.armed = base_armed + armed
             self._persist_armed()
 
             job.status = "done" if job.status != "cancelled" else job.status
             if job.status == "cancelled":
-                job.detail = f"Cancelled · drafts written {job.ok} · {job.skipped} kept for retry"
+                job.detail = (
+                    f"Cancelled · {job.ok} written just now · {job.skipped} left — "
+                    "Write drafts continues from here"
+                )
             else:
-                job.detail = f"Drafts written in {job.ok} DMs (unsent)"
+                job.detail = f"Drafts written in {job.ok + have_draft} DMs (unsent)"
+                if have_draft:
+                    job.detail += f" ({have_draft} were already done)"
                 if already_sent:
                     job.detail += f" · {already_sent} already DMed, excluded"
                 if job.skipped:
@@ -999,7 +1060,19 @@ class HydraEngine:
                     )
                 )
 
-            results = await self._burst(requests, job, "fire drafts", [t.user_id for t in targets])
+            def commit(results: list[tuple[str, Any]]) -> None:
+                # Persist after every container: sent users are recorded and
+                # the armed list shrinks as drafts go out — crash-safe.
+                ok_ids = {t.user_id for t, (s, _) in zip(targets, results) if s == "ok"}
+                if ok_ids:
+                    self.sent_ids.update(ok_ids)
+                    self._persist_sent()
+                self.armed = [t for t, (s, _) in zip(targets, results) if s != "ok"]
+                self._persist_armed()
+
+            results = await self._burst(
+                requests, job, "fire drafts", [t.user_id for t in targets], commit=commit
+            )
 
             # Keep every target that did not go out (failed or flood-skipped)
             # armed, so "Send all drafts" can resume them later.
@@ -1053,7 +1126,15 @@ class HydraEngine:
                 )
                 for t in targets
             ]
-            results = await self._burst(requests, job, "send now", [t.user_id for t in targets])
+            def commit(results: list[tuple[str, Any]]) -> None:
+                ok_ids = {t.user_id for t, (s, _) in zip(targets, results) if s == "ok"}
+                if ok_ids:
+                    self.sent_ids.update(ok_ids)
+                    self._persist_sent()
+
+            results = await self._burst(
+                requests, job, "send now", [t.user_id for t in targets], commit=commit
+            )
             for t, (status, _) in zip(targets, results):
                 if status == "ok":
                     self.sent_ids.add(t.user_id)
@@ -1116,7 +1197,15 @@ class HydraEngine:
                 )
                 for t in targets
             ]
-            results = await self._burst(requests, job, "broadcast", [t.user_id for t in targets])
+            def commit(results: list[tuple[str, Any]]) -> None:
+                ok_ids = {t.user_id for t, (s, _) in zip(targets, results) if s == "ok"}
+                if ok_ids:
+                    self.sent_ids.update(ok_ids)
+                    self._persist_sent()
+
+            results = await self._burst(
+                requests, job, "broadcast", [t.user_id for t in targets], commit=commit
+            )
             sent_ok = [t.user_id for t, (status, _) in zip(targets, results) if status == "ok"]
             if sent_ok:
                 self.sent_ids.update(sent_ok)
