@@ -173,17 +173,20 @@ def reqs(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     start = page * PEOPLE_PER
     chunk = people[start : start + PEOPLE_PER]
     title = esc(ws.selected_chat["title"])
+    dmed = sum(1 for p in ws.people if p.get("dm_sent"))
     text = (
         f"<b>Join requests</b>\n{title}\n"
         f"{len(ws.people)} pending · {len(ws.selected_ids)} selected"
-        "\n<i>Read only — HYDRA does not accept or decline.</i>"
+        + (f" · {dmed} already DMed ✅" if dmed else "")
+        + "\n<i>Read only — HYDRA does not accept or decline.</i>"
     )
     rows: list[list[InlineKeyboardButton]] = []
     for i, p in enumerate(chunk):
         idx = start + i
         on = "☑" if p["id"] in ws.selected_ids else "☐"
         uname = f" @{p['username']}" if p.get("username") else ""
-        rows.append([B(f"{on}  {p['name']}{uname}", f"rq:{idx}")])
+        mark = " ✅" if p.get("dm_sent") else ""
+        rows.append([B(f"{on}  {p['name']}{uname}{mark}", f"rq:{idx}")])
     navrow: list[InlineKeyboardButton] = []
     last_page = max(len(people) - 1, 0) // PEOPLE_PER
     if page > 0:
@@ -192,7 +195,7 @@ def reqs(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     if start + PEOPLE_PER < len(people):
         navrow.append(B("▶", f"reqs:p:{page + 1}"))
     rows.append(navrow)
-    rows.append([B("Select all", "reqs:all"), B("Select none", "reqs:none")])
+    rows.append([B("Select all", "reqs:all"), B("Unsent only", "reqs:unsent"), B("Select none", "reqs:none")])
     rows.append([B("Reload", "reqs:load"), B("Filter", "reqs:filter")])
     rows.append(nav("go:chats"))
     return text, kb(rows)
@@ -313,6 +316,7 @@ def settings(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     rows = [
         [B("Refresh panel", "go:home")],
         [B("Export session", "sess:export")],
+        [B(f"Clear DM history ({len(engine.sent_ids)})", "act:clrsent")],
         nav(),
     ]
     return text, kb(rows)
@@ -353,6 +357,12 @@ def confirm(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
             "Send all drafts",
             f"Release <b>{len(engine.armed)}</b> armed drafts now.",
             "do:fire",
+        ),
+        "clrsent": (
+            "Clear DM history",
+            f"Forget the <b>{len(engine.sent_ids)}</b> stored already-DMed records. "
+            "Those people become selectable for DMs again.",
+            "do:clrsent",
         ),
         "send": (
             "Send DMs now",

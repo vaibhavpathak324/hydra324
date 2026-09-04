@@ -219,6 +219,14 @@ async def send(body: PeoplePayload):
         raise _fail(exc)
 
 
+@app.post("/api/clear-sent")
+async def clear_sent():
+    n = await engine.clear_sent()
+    snap = engine.snapshot()
+    snap["cleared"] = n
+    return snap
+
+
 @app.post("/api/disarm")
 async def disarm():
     try:

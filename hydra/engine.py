@@ -138,6 +138,8 @@ class HydraEngine:
         self.phone: Optional[str] = None
         self.phone_code_hash: Optional[str] = None
         self.me: Optional[dict[str, Any]] = None
+        # user_ids this account has already DMed — never double-send (persisted).
+        self.sent_ids: set[int] = set()
         self.phase: str = "logged_out"
         self.armed: list[ArmedTarget] = []
         self.job: Optional[Job] = None
@@ -190,6 +192,7 @@ class HydraEngine:
             "phase": self.phase,
             "me": self.me,
             "armed": len(self.armed),
+            "sent": len(self.sent_ids),
             "job": self.job.as_dict() if self.job else None,
         }
 
@@ -239,7 +242,7 @@ class HydraEngine:
             if await self.client.is_user_authorized():
                 await self._mark_online()
                 self.note("ok", "Resumed existing session.")
-                await self._restore_armed()
+                await self._restore_state()
             else:
                 await self.client.disconnect()
                 self.client = None
@@ -249,15 +252,43 @@ class HydraEngine:
             self.client = None
             self.phase = "logged_out"
 
-    async def _restore_armed(self) -> None:
-        """Rebuild the armed-draft list from the state store (survives restarts)."""
+    async def _restore_state(self) -> None:
+        """Rebuild armed drafts + DM history from the state store (survives restarts)."""
         try:
-            raw = await store.get("armed") or []
-            self.armed = [ArmedTarget(**a) for a in raw]
+            armed_uid = await store.get("armed_uid")
+            if armed_uid is None or armed_uid == (self.me or {}).get("id"):
+                raw = await store.get("armed") or []
+                self.armed = [ArmedTarget(**a) for a in raw]
+            else:
+                self.armed = []  # armed list belonged to a different account
         except Exception:
             self.armed = []
         if self.armed:
             self.note("ok", f"Restored {len(self.armed)} armed drafts — Send all drafts to resume them.")
+        try:
+            sent = await store.get("sent") or {}
+            if sent.get("uid") and self.me and sent["uid"] == self.me.get("id"):
+                self.sent_ids = set(int(x) for x in sent.get("ids") or [])
+                if self.sent_ids:
+                    self.note("ok", f"DM history loaded — {len(self.sent_ids)} already DMed, they'll be skipped.")
+        except Exception:
+            self.sent_ids = set()
+
+    def _persist_armed(self) -> None:
+        store.push_soon("armed_uid", (self.me or {}).get("id"))
+        store.push_soon("armed", [asdict(a) for a in self.armed])
+
+    def _persist_sent(self) -> None:
+        uid = (self.me or {}).get("id")
+        if uid:
+            store.push_soon("sent", {"uid": uid, "ids": list(self.sent_ids)})
+
+    async def clear_sent(self) -> int:
+        n = len(self.sent_ids)
+        self.sent_ids = set()
+        store.push_soon("sent", None)
+        self.note("ok", f"Cleared DM history ({n} records). Those people can be DMed again.")
+        return n
 
     # ── auth ────────────────────────────────────────────────
     async def start_login(self, api_id: int, api_hash: str, phone: str) -> dict[str, Any]:
@@ -329,6 +360,7 @@ class HydraEngine:
             )
             store.push_soon("session", self.client.session.save())
         await self._mark_online()
+        await self._restore_state()
         self.note("ok", f"Session live as {self.me.get('name') if self.me else '?'}.")
         self.emit("status", **self.snapshot())
 
@@ -444,24 +476,42 @@ class HydraEngine:
         offset_date: Any = EPOCH
         offset_user: Any = InputUserEmpty()
         seen: set[int] = set()
+        pages = 0
+        flood_budget = 300  # seconds of flood-wait tolerated while listing
 
         while True:
-            result = await client(
-                GetChatInviteImportersRequest(
-                    peer=peer,
-                    requested=True,
-                    offset_date=offset_date,
-                    offset_user=offset_user,
-                    limit=100,
+            try:
+                result = await client(
+                    GetChatInviteImportersRequest(
+                        peer=peer,
+                        requested=True,
+                        offset_date=offset_date,
+                        offset_user=offset_user,
+                        limit=100,
+                    )
                 )
-            )
+            except FloodWaitError as exc:
+                wait = min(int(getattr(exc, "seconds", 1) or 1), 60)
+                if flood_budget <= 0:
+                    self.note(
+                        "warn",
+                        f"Listing paused at {len(people)} — Telegram is throttling. "
+                        "Open Requests again later to load the rest.",
+                    )
+                    break
+                flood_budget -= wait
+                self.note("warn", f"Flood wait {wait}s while listing requests — continuing.")
+                await asyncio.sleep(wait + 1)
+                continue
             users = {u.id: u for u in result.users if isinstance(u, User)}
             if not result.importers:
                 break
+            new_seen = 0
             for imp in result.importers:
                 if imp.user_id in seen:
                     continue
                 seen.add(imp.user_id)
+                new_seen += 1
                 user = users.get(imp.user_id)
                 date = imp.date
                 if isinstance(date, datetime):
@@ -476,17 +526,26 @@ class HydraEngine:
                         "username": getattr(user, "username", None) if user else None,
                         "about": imp.about or "",
                         "date": date_s,
+                        "dm_sent": imp.user_id in self.sent_ids,
                     }
                 )
+            pages += 1
+            if pages >= 1500:  # 150k requesters — hard safety stop
+                self.note("warn", "Listing stopped at the 150k safety cap.")
+                break
+            if new_seen == 0:
+                break  # offset no longer advancing — done
             last = result.importers[-1]
-            offset_date = last.date
             last_user = users.get(last.user_id)
             if last_user:
+                offset_date = last.date
                 offset_user = InputUser(user_id=last_user.id, access_hash=last_user.access_hash)
             else:
                 break
-            if len(result.importers) < 100:
-                break
+            # NOTE: do NOT stop on short pages (<100) — Telegram routinely
+            # returns a few less than requested; only an empty/non-advancing
+            # page means we are done. Stopping early truncated lists at ~199.
+            await asyncio.sleep(0.2)
 
         self.note("ok", f"Loaded {len(people)} pending join requests (not approved, not declined).")
         return people
@@ -636,7 +695,7 @@ class HydraEngine:
 
     def _targets_from_people(
         self, people: list[dict[str, Any]], message: str, chat_id: int
-    ) -> list[ArmedTarget]:
+    ) -> tuple[list[ArmedTarget], int]:
         text = message.strip()
         if not text:
             raise RuntimeError("Message is empty.")
@@ -644,10 +703,14 @@ class HydraEngine:
             raise RuntimeError("No requesters selected.")
         targets: list[ArmedTarget] = []
         missing_hash = 0
+        already_sent = 0
         for p in people:
             ah = int(p.get("access_hash") or 0)
             if not ah:
                 missing_hash += 1
+                continue
+            if int(p["id"]) in self.sent_ids:
+                already_sent += 1
                 continue
             targets.append(
                 ArmedTarget(
@@ -661,9 +724,11 @@ class HydraEngine:
             )
         if missing_hash:
             self.note("warn", f"Skipped {missing_hash} requester(s) with no access_hash.")
+        if already_sent:
+            self.note("ok", f"{already_sent} requester(s) already DMed before — excluded, no double DMs.")
         if not targets:
-            raise RuntimeError("No reachable requesters (missing access hashes).")
-        return targets
+            raise RuntimeError("No one left to DM — selection is empty, already DMed, or unreachable.")
+        return targets, already_sent
 
     def _peer(self, t: ArmedTarget) -> InputPeerUser:
         return InputPeerUser(user_id=t.user_id, access_hash=t.access_hash)
@@ -674,7 +739,7 @@ class HydraEngine:
     ) -> dict[str, Any]:
         """Write the same message as an unsent draft in each requester's DM, in bursts."""
         async with self._job_lock:
-            targets = self._targets_from_people(people, message, chat_id)
+            targets, already_sent = self._targets_from_people(people, message, chat_id)
             job = Job(id=f"arm-{int(time.time())}", kind="arm", total=len(targets))
             self.job = job
             self.emit("job", job=job.as_dict())
@@ -695,10 +760,12 @@ class HydraEngine:
             # Replace previous arm for these users, keep others.
             keep_ids = {t.user_id for t in armed}
             self.armed = [a for a in self.armed if a.user_id not in keep_ids] + armed
-            store.push_soon("armed", [asdict(a) for a in self.armed])
+            self._persist_armed()
 
             job.status = "done"
             job.detail = f"Drafts written in {job.ok} DMs (unsent)"
+            if already_sent:
+                job.detail += f" · {already_sent} already DMed, excluded"
             if job.skipped:
                 job.detail += f" · {job.skipped} skipped (flood — try again later)"
             self.emit("job", job=job.as_dict())
@@ -744,7 +811,7 @@ class HydraEngine:
                     self.note("ok", f"{dropped} drafts already sent or cleared — skipping them.")
                 if not targets:
                     self.armed = []
-                    store.push_soon("armed", [])
+                    self._persist_armed()
                     job.status = "done"
                     job.detail = "Nothing to send — every draft was already sent or cleared."
                     self.emit("job", job=job.as_dict())
@@ -769,7 +836,11 @@ class HydraEngine:
             # Keep every target that did not go out (failed or flood-skipped)
             # armed, so "Send all drafts" can resume them later.
             self.armed = [t for t, (status, _) in zip(targets, results) if status != "ok"]
-            store.push_soon("armed", [asdict(a) for a in self.armed])
+            self._persist_armed()
+            fired = [t.user_id for t, (status, _) in zip(targets, results) if status == "ok"]
+            if fired:
+                self.sent_ids.update(fired)
+                self._persist_sent()
 
             job.status = "done"
             job.detail = f"Sent {job.ok} · failed {job.fail}"
@@ -784,7 +855,7 @@ class HydraEngine:
         self, chat_id: int, people: list[dict[str, Any]], message: str
     ) -> dict[str, Any]:
         async with self._job_lock:
-            targets = self._targets_from_people(people, message, chat_id)
+            targets, already_sent = self._targets_from_people(people, message, chat_id)
             job = Job(id=f"send-{int(time.time())}", kind="send", total=len(targets))
             self.job = job
             self.emit("job", job=job.as_dict())
@@ -799,9 +870,15 @@ class HydraEngine:
                 )
                 for t in targets
             ]
-            await self._burst(requests, job, "send now", [t.user_id for t in targets])
+            results = await self._burst(requests, job, "send now", [t.user_id for t in targets])
+            for t, (status, _) in zip(targets, results):
+                if status == "ok":
+                    self.sent_ids.add(t.user_id)
+            self._persist_sent()
             job.status = "done"
             job.detail = f"Sent {job.ok} · failed {job.fail}"
+            if already_sent:
+                job.detail += f" · {already_sent} already DMed, excluded"
             if job.skipped:
                 job.detail += f" · {job.skipped} skipped (flood) — send to them again later"
                 self.note(
@@ -827,7 +904,7 @@ class HydraEngine:
             ]
             await self._burst(requests, job, "clear drafts", [t.user_id for t in targets])
             self.armed = []
-            store.push_soon("armed", [])
+            self._persist_armed()
             job.status = "done"
             job.detail = "Drafts cleared"
             self.emit("job", job=job.as_dict())

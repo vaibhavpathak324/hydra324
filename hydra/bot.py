@@ -473,6 +473,8 @@ class BotController:
             return "Sent as a separate message"
         if data == "act:logout":
             return self._confirm("logout")
+        if data == "act:clrsent":
+            return self._confirm("clrsent")
 
         if data == "chats:load":
             return await self._load_chats()
@@ -506,6 +508,11 @@ class BotController:
             self.ws.selected_ids = set()
             self.ws.screen = "reqs"
             return "Cleared"
+        if data == "reqs:unsent":
+            self.ws.selected_ids = {p["id"] for p in self.ws.people if not p.get("dm_sent")}
+            self.ws.people_page = 0
+            self.ws.screen = "reqs"
+            return f"{len(self.ws.selected_ids)} unsent selected"
         if data == "reqs:filter":
             return self._ask("people_filter", "reqs")
         if data.startswith("reqs:p:"):
@@ -579,6 +586,7 @@ class BotController:
             "do:inlinedm": self._run_inline_dm,
             "do:disarm": self._run_disarm,
             "do:logout": self._run_logout,
+            "do:clrsent": self._run_clr_sent,
             "do:postinline": self._run_post_inline,
             "do:postsession": self._run_post_session,
             "do:postbot": self._run_post_bot,
@@ -777,6 +785,9 @@ class BotController:
 
     async def _run_disarm(self) -> None:
         await engine.disarm()
+
+    async def _run_clr_sent(self) -> None:
+        await engine.clear_sent()
 
     async def _run_logout(self) -> None:
         await engine.logout()
