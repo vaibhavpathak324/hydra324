@@ -34,7 +34,7 @@ from telegram.ext import (
 )
 
 from hydra import store
-from hydra.engine import DATA, engine
+from hydra.engine import DATA, engine, pool
 from hydra.panel import esc, render
 
 log = logging.getLogger("hydra.bot")
@@ -123,6 +123,8 @@ class BotController:
         self._pump_task: Optional[asyncio.Task] = None
         self._queue = None
         self.inline_store: dict[str, dict[str, Any]] = {}
+        # Engine being logged in by the wizard (multi-session support).
+        self._login_eng = None
 
     # ── workspace persistence (survives restarts) ───────────
     def _ws_persist_core(self) -> None:
@@ -137,6 +139,39 @@ class BotController:
                 "people_filter": self.ws.people_filter,
             },
         )
+
+    async def _ws_persist_core_now(self) -> None:
+        """Synchronous variant for critical saves — survives instant restarts."""
+        await store.set(
+            "ws",
+            {
+                "message": self.ws.message,
+                "buttons": self.ws.buttons,
+                "chats": self.ws.chats,
+                "selected_chat": self.ws.selected_chat,
+                "chat_filter": self.ws.chat_filter,
+                "people_filter": self.ws.people_filter,
+            },
+        )
+
+    async def _finish_login(self, le: Any) -> str:
+        """Complete the wizard: adopt the new session and make it active."""
+        if self._login_eng is not None:
+            await pool.adopt(self._login_eng)
+            self._login_eng = None
+            msg = "Session added — now active."
+        else:
+            msg = "Session live."
+        self.ws.chats = []
+        self.ws.people = []
+        self.ws.selected_chat = None
+        self.ws.selected_ids = set()
+        store.push_soon("ws_people", None)
+        store.push_soon("ws_sel", None)
+        await self._ws_persist_core_now()
+        self.ws.waiting = None
+        self.ws.screen = "home"
+        return msg
 
     def _ws_persist_people(self) -> None:
         store.push_soon("ws_people", self.ws.people)
@@ -493,6 +528,7 @@ class BotController:
 
         if data == "sess:phone":
             self.ws.login = {}
+            self._login_eng = pool.new_login()
             env_api_id = (os.environ.get("TELEGRAM_API_ID") or os.environ.get("API_ID") or "").strip()
             env_api_hash = (os.environ.get("TELEGRAM_API_HASH") or os.environ.get("API_HASH") or "").strip()
             if env_api_id.isdigit() and env_api_hash:
@@ -501,7 +537,28 @@ class BotController:
             return self._ask("api_id", "session")
         if data == "sess:string":
             self.ws.login = {}
+            self._login_eng = pool.new_login()
             return self._ask("s_api_id", "session")
+        if data.startswith("sess:sw:"):
+            key = data.split(":", 2)[2]
+            if await pool.switch(key):
+                # chats/requests/selection are per-account — reload for this one
+                self.ws.chats = []
+                self.ws.people = []
+                self.ws.selected_chat = None
+                self.ws.selected_ids = set()
+                store.push_soon("ws_people", None)
+                store.push_soon("ws_sel", None)
+                await self._ws_persist_core_now()
+                self.ws.screen = "session"
+                return "Switched — reload chats & requests for this account."
+            return "No such session."
+        if data.startswith("sess:rm:"):
+            key = data.split(":", 2)[2]
+            if key not in pool.engines:
+                return "No such session."
+            self.ws.login["_rmkey"] = key
+            return self._confirm("sesrm")
         if data == "sess:export":
             raw = engine.export_session_string()
             if not raw:
@@ -674,6 +731,7 @@ class BotController:
             "do:clrsent": self._run_clr_sent,
             "do:auto": self._run_auto_on,
             "do:bcast": self._run_bcast,
+            "do:sesrm": self._run_rm_session,
             "do:postinline": self._run_post_inline,
             "do:postsession": self._run_post_session,
             "do:postbot": self._run_post_bot,
@@ -711,24 +769,23 @@ class BotController:
             return self._ask("phone", "session")
         if w == "phone":
             self.ws.login["phone"] = text.strip()
-            await engine.start_login(
+            le = self._login_eng if self._login_eng is not None else pool.ensure_active()
+            await le.start_login(
                 int(self.ws.login["api_id"]),
                 self.ws.login["api_hash"],
                 self.ws.login["phone"],
             )
             return self._ask("code", "session")
         if w == "code":
-            data = await engine.submit_code(text.strip())
+            le = self._login_eng if self._login_eng is not None else pool.ensure_active()
+            data = await le.submit_code(text.strip())
             if data.get("phase") == "awaiting_password":
                 return self._ask("password", "session")
-            self.ws.waiting = None
-            self.ws.screen = "home"
-            return "Session live."
+            return await self._finish_login(le)
         if w == "password":
-            await engine.submit_password(text)
-            self.ws.waiting = None
-            self.ws.screen = "home"
-            return "Session live."
+            le = self._login_eng if self._login_eng is not None else pool.ensure_active()
+            await le.submit_password(text)
+            return await self._finish_login(le)
 
         if w == "s_api_id":
             self.ws.login["api_id"] = str(int(text))
@@ -737,19 +794,20 @@ class BotController:
             self.ws.login["api_hash"] = text.strip()
             return self._ask("session_string", "session")
         if w == "session_string":
-            await engine.login_string(
+            le = self._login_eng if self._login_eng is not None else pool.ensure_active()
+            await le.login_string(
                 int(self.ws.login["api_id"]),
                 self.ws.login["api_hash"],
                 text.strip(),
             )
-            self.ws.waiting = None
-            self.ws.screen = "home"
-            return "Session live."
+            return await self._finish_login(le)
 
         if w == "message":
             self.ws.message = text
             self.ws.waiting = None
             self.ws.screen = "msg"
+            # synchronous save — the message must survive any restart
+            await self._ws_persist_core_now()
             return "Saved"
         if w == "btn_label":
             self.ws.tmp_label = text.strip()[:64]
@@ -904,13 +962,28 @@ class BotController:
     async def _run_bcast(self) -> None:
         await engine.broadcast(self.ws.message.strip())
 
-    async def _run_logout(self) -> None:
-        await engine.logout()
+    async def _run_rm_session(self) -> None:
+        key = str(self.ws.login.pop("_rmkey", "") or "")
+        if key:
+            await pool.remove(key)
         self.ws.chats = []
         self.ws.people = []
         self.ws.selected_chat = None
         self.ws.selected_ids = set()
-        store.push_soon("ws", None)
+        store.push_soon("ws_people", None)
+        store.push_soon("ws_sel", None)
+        await self._ws_persist_core_now()
+        self.ws.screen = "session"
+
+    async def _run_logout(self) -> None:
+        key = pool.active_key
+        await engine.logout()
+        if key:
+            pool.forget(key)
+        self.ws.chats = []
+        self.ws.people = []
+        self.ws.selected_chat = None
+        self.ws.selected_ids = set()
         store.push_soon("ws_people", None)
         store.push_soon("ws_sel", None)
         self.ws.screen = "session"

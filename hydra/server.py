@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from hydra import store
 from hydra.bot import controller
-from hydra.engine import DATA, engine
+from hydra.engine import DATA, engine, pool
 
 log = logging.getLogger("hydra.server")
 WEB = Path(__file__).resolve().parent.parent / "web"
@@ -25,7 +25,7 @@ WEB = Path(__file__).resolve().parent.parent / "web"
 async def lifespan(app: FastAPI):
     DATA.mkdir(parents=True, exist_ok=True)
     await store.init()
-    await engine.try_resume()
+    await pool.bootstrap()
     engine.start_background()
     try:
         await controller.start()
@@ -37,11 +37,14 @@ async def lifespan(app: FastAPI):
         await controller.stop()
     except Exception:
         pass
-    if engine.client:
-        try:
-            await engine.client.disconnect()
-        except Exception:
-            pass
+    for eng in pool.engines.values():
+        if eng.client:
+            try:
+                await eng.client.disconnect()
+            except Exception:
+                pass
+    # Let pending state writes reach Supabase before the process exits.
+    await store.flush()
 
 
 app = FastAPI(title="HYDRA 324", lifespan=lifespan)
@@ -104,6 +107,7 @@ async def index():
 async def status():
     snap = engine.snapshot()
     snap["bot"] = controller.status()
+    snap["sessions"] = pool.summary()
     snap["defaults"] = {
         "api_id": (os.environ.get("TELEGRAM_API_ID") or os.environ.get("API_ID") or "").strip(),
         "api_hash": (os.environ.get("TELEGRAM_API_HASH") or os.environ.get("API_HASH") or "").strip(),
@@ -114,7 +118,7 @@ async def status():
 @app.post("/api/auth/start")
 async def auth_start(body: LoginStart):
     try:
-        return await engine.start_login(body.api_id, body.api_hash, body.phone)
+        return await pool.ensure_active().start_login(body.api_id, body.api_hash, body.phone)
     except Exception as exc:
         raise _fail(exc)
 
@@ -138,7 +142,7 @@ async def auth_password(body: LoginPassword):
 @app.post("/api/auth/string")
 async def auth_string(body: LoginString):
     try:
-        return await engine.login_string(body.api_id, body.api_hash, body.session_string)
+        return await pool.ensure_active().login_string(body.api_id, body.api_hash, body.session_string)
     except Exception as exc:
         raise _fail(exc)
 

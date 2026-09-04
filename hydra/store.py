@@ -138,3 +138,14 @@ async def pull_to_file(key: str, path: Path) -> bool:
     except Exception as exc:  # noqa: BLE001
         log.warning("Could not restore %s: %s", path.name, exc)
         return False
+
+
+async def flush(timeout: float = 3.0) -> None:
+    """Wait for pending fire-and-forget writes so shutdowns lose nothing."""
+    tasks = [t for t in list(_TASKS) if not t.done()]
+    if not tasks:
+        return
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        pass

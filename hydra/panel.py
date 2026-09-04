@@ -83,15 +83,22 @@ def render(engine, ws, bot_username: str = "") -> tuple[str, InlineKeyboardMarku
 
 
 def home(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    from hydra.engine import pool
+
     chat = ws.selected_chat
     chat_s = esc(chat["title"]) if chat else "none selected"
     n_sel = len(ws.selected_ids)
     n_ppl = len(ws.people)
     n_btn = sum(len(r) for r in ws.buttons)
+    try:
+        n_sessions = len(pool.summary())
+    except Exception:
+        n_sessions = 1
+    more = f" (+{n_sessions - 1})" if n_sessions > 1 else ""
     text = (
         "<b>HYDRA 324</b>\n"
         "<i>tap buttons — don’t type commands</i>\n\n"
-        f"Session     {session_line(engine)}\n"
+        f"Session     {session_line(engine)}{more}\n"
         f"Chat        {chat_s}\n"
         f"Requests    {n_ppl} loaded · {n_sel} selected\n"
         f"Drafts      {len(engine.armed)} armed\n"
@@ -109,26 +116,48 @@ def home(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
 
 
 def session(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
-    extra = ""
-    if engine.phase == "ready" and engine.me:
-        extra = (
-            f"\nLogged in as {session_line(engine)}\n"
-            f"Phone {esc(engine.me.get('phone') or '—')}\n"
+    from hydra.engine import pool
+
+    sessions = pool.summary()
+    if not sessions:
+        text = (
+            "<b>Sessions</b>\n\n"
+            "No account session connected.\n"
+            "The control bot is only the remote — requests and DMs run on user sessions."
         )
+        rows = [
+            [B("➕ Add session — phone", "sess:phone")],
+            [B("➕ Add — session string", "sess:string")],
+            nav(),
+        ]
+        return text, kb(rows)
+
+    lines: list[str] = []
+    rows: list[list[InlineKeyboardButton]] = []
+    for s in sessions:
+        me = s.get("me") or {}
+        who = me.get("username") or me.get("name") or me.get("phone") or s["key"]
+        mark = "●" if s["active"] else "○"
+        extra = []
+        if s.get("auto"):
+            extra.append("auto")
+        if s.get("armed"):
+            extra.append(f"{s['armed']} drafts")
+        tail = (" · " + ", ".join(extra)) if extra else ""
+        lines.append(f"{mark} {esc(str(who))}{tail}")
+        label = f"{mark} {str(who)}"[:60]
+        rows.append([B(label, f"sess:sw:{s['key']}"), B("✕", f"sess:rm:{s['key']}")])
     text = (
-        "<b>Account session</b>\n\n"
-        "The control bot is only the remote. "
-        "Join requests and DMs run on a <b>user session</b>.\n"
-        f"{extra}\n"
-        f"Status: <code>{esc(engine.phase)}</code>"
+        "<b>Sessions</b>\n\n"
+        + "\n".join(lines)
+        + "\n\n<i>Tap a session to make it active — every action runs on it. "
+        "✕ removes it. All sessions stay connected and keep auto-sending.</i>"
     )
-    rows = [
-        [B("Connect with phone", "sess:phone")],
-        [B("Paste session string", "sess:string")],
-        [B("Export session", "sess:export")],
-        [B("Log out session", "act:logout")],
-        nav(),
-    ]
+    rows.append([B("➕ Add session — phone", "sess:phone")])
+    rows.append([B("➕ Add — session string", "sess:string")])
+    if engine.phase == "ready":
+        rows.append([B("Export active session", "sess:export")])
+    rows.append(nav())
     return text, kb(rows)
 
 
@@ -423,6 +452,12 @@ def confirm(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
             "recipients — everyone this account has ever DMed. They get it even "
             "if they were DMed before.",
             "do:bcast",
+        ),
+        "sesrm": (
+            "Remove session",
+            f"Log out and remove <code>{esc(str(ws.login.get('_rmkey', '')))}</code>? "
+            "Its drafts and DM history for that account are deleted.",
+            "do:sesrm",
         ),
         "send": (
             "Send DMs now",

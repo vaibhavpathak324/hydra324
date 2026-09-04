@@ -57,6 +57,9 @@ BURST = 48
 # Pacing between MTProto containers. Drafts are cheap; keep this snappy but
 # not so fast that Telegram flood-waits every container.
 BURST_PACE = 0.35
+# Draft writing is much cheaper for Telegram than sending — run it wider.
+ARM_BURST = 64
+ARM_PACE = 0.15
 # Flood-wait policy: short waits are slept off and the job resumes on its own.
 # A single wait longer than FLOOD_SLEEP_CAP (or too much total waiting) pauses
 # the job instead of freezing it for hours; unattempted targets are reported
@@ -135,7 +138,17 @@ class Job:
 
 
 class HydraEngine:
-    def __init__(self) -> None:
+    def __init__(self, skey: str = "main") -> None:
+        # Per-session key: state in the Supabase store is namespaced by this
+        # ("main" keeps the legacy unprefixed keys so existing data migrates).
+        self.skey = skey
+        if skey == "main":
+            self.creds_path = DATA / "creds.json"
+            self.session_path = DATA / "session.string"
+        else:
+            safe = "".join(ch for ch in skey if ch.isalnum() or ch in "-_")
+            self.creds_path = DATA / f"creds-{safe}.json"
+            self.session_path = DATA / f"session-{safe}.string"
         self.client: Optional[TelegramClient] = None
         self.api_id: Optional[int] = None
         self.api_hash: Optional[str] = None
@@ -157,6 +170,9 @@ class HydraEngine:
         self._listeners: set[asyncio.Queue] = set()
         self._lock = asyncio.Lock()
         self._job_lock = asyncio.Lock()
+
+    def _k(self, name: str) -> str:
+        return name if self.skey == "main" else f"{self.skey}:{name}"
 
     def _make_client(self, session: StringSession) -> TelegramClient:
         client = TelegramClient(
@@ -212,7 +228,7 @@ class HydraEngine:
     # ── persistence ─────────────────────────────────────────
     def _write_creds(self) -> None:
         DATA.mkdir(parents=True, exist_ok=True)
-        CREDS_PATH.write_text(
+        self.creds_path.write_text(
             json.dumps(
                 {
                     "api_id": self.api_id,
@@ -227,7 +243,7 @@ class HydraEngine:
             return
         DATA.mkdir(parents=True, exist_ok=True)
         raw = self.client.session.save()
-        SESSION_PATH.write_text(raw)
+        self.session_path.write_text(raw)
 
     def export_session_string(self) -> Optional[str]:
         if not self.client:
@@ -235,16 +251,16 @@ class HydraEngine:
         return self.client.session.save()
 
     async def try_resume(self) -> None:
-        if not CREDS_PATH.exists() or not SESSION_PATH.exists():
+        if not self.creds_path.exists() or not self.session_path.exists():
             # Ephemeral filesystem (e.g. Render free tier): restore from the
             # Supabase state store before giving up.
-            await store.pull_to_file("creds", CREDS_PATH)
-            await store.pull_to_file("session", SESSION_PATH)
-        if not CREDS_PATH.exists() or not SESSION_PATH.exists():
+            await store.pull_to_file(self._k("creds"), self.creds_path)
+            await store.pull_to_file(self._k("session"), self.session_path)
+        if not self.creds_path.exists() or not self.session_path.exists():
             return
         try:
-            creds = json.loads(CREDS_PATH.read_text())
-            session = SESSION_PATH.read_text().strip()
+            creds = json.loads(self.creds_path.read_text())
+            session = self.session_path.read_text().strip()
             if not session or not creds.get("api_id"):
                 return
             self.api_id = int(creds["api_id"])
@@ -268,9 +284,9 @@ class HydraEngine:
     async def _restore_state(self) -> None:
         """Rebuild armed drafts + DM history from the state store (survives restarts)."""
         try:
-            armed_uid = await store.get("armed_uid")
+            armed_uid = await store.get(self._k("armed_uid"))
             if armed_uid is None or armed_uid == (self.me or {}).get("id"):
-                raw = await store.get("armed") or []
+                raw = await store.get(self._k("armed")) or []
                 self.armed = [ArmedTarget(**a) for a in raw]
             else:
                 self.armed = []  # armed list belonged to a different account
@@ -279,7 +295,7 @@ class HydraEngine:
         if self.armed:
             self.note("ok", f"Restored {len(self.armed)} armed drafts — Send all drafts to resume them.")
         try:
-            sent = await store.get("sent") or {}
+            sent = await store.get(self._k("sent")) or {}
             if sent.get("uid") and self.me and sent["uid"] == self.me.get("id"):
                 self.sent_ids = set(int(x) for x in sent.get("ids") or [])
                 if self.sent_ids:
@@ -287,7 +303,7 @@ class HydraEngine:
         except Exception:
             self.sent_ids = set()
         try:
-            d = await store.get("dir") or {}
+            d = await store.get(self._k("dir")) or {}
             if d.get("uid") and self.me and d["uid"] == self.me.get("id"):
                 self.dmdir = {int(k): v for k, v in (d.get("dir") or {}).items()}
                 if self.dmdir:
@@ -295,7 +311,7 @@ class HydraEngine:
         except Exception:
             self.dmdir = {}
         try:
-            auto = await store.get("auto") or {}
+            auto = await store.get(self._k("auto")) or {}
             self.auto = auto if isinstance(auto, dict) else {}
         except Exception:
             self.auto = {}
@@ -304,16 +320,16 @@ class HydraEngine:
             self.note("ok", f"Auto-send restored — {len(self._auto_remaining())} still to DM.")
 
     def _persist_armed(self) -> None:
-        store.push_soon("armed_uid", (self.me or {}).get("id"))
-        store.push_soon("armed", [asdict(a) for a in self.armed])
+        store.push_soon(self._k("armed_uid"), (self.me or {}).get("id"))
+        store.push_soon(self._k("armed"), [asdict(a) for a in self.armed])
 
     def _persist_sent(self) -> None:
         uid = (self.me or {}).get("id")
         if uid:
-            store.push_soon("sent", {"uid": uid, "ids": list(self.sent_ids)})
+            store.push_soon(self._k("sent"), {"uid": uid, "ids": list(self.sent_ids)})
 
     def _persist_dir(self) -> None:
-        store.push_soon("dir", {"uid": (self.me or {}).get("id"), "dir": self.dmdir})
+        store.push_soon(self._k("dir"), {"uid": (self.me or {}).get("id"), "dir": self.dmdir})
 
     def merge_people(self, people: list[dict[str, Any]]) -> int:
         """Remember requesters (with access hashes) as potential DM recipients."""
@@ -349,7 +365,7 @@ class HydraEngine:
     async def clear_sent(self) -> int:
         n = len(self.sent_ids)
         self.sent_ids = set()
-        store.push_soon("sent", None)
+        store.push_soon(self._k("sent"), None)
         self.note("ok", f"Cleared DM history ({n} records). Those people can be DMed again.")
         return n
 
@@ -392,7 +408,7 @@ class HydraEngine:
             "interval": interval,
             "next": time.time() + 20,
         }
-        store.push_soon("auto", self.auto)
+        store.push_soon(self._k("auto"), self.auto)
         self._ensure_auto_loop()
         self.note(
             "ok",
@@ -402,7 +418,7 @@ class HydraEngine:
 
     async def auto_stop(self) -> None:
         self.auto = {"on": False, "interval": (self.auto or {}).get("interval", 30)}
-        store.push_soon("auto", self.auto)
+        store.push_soon(self._k("auto"), self.auto)
         self.note("ok", "Auto-send stopped.")
         self.emit("status", **self.snapshot())
 
@@ -411,7 +427,7 @@ class HydraEngine:
         a["interval"] = max(10, min(1440, int(minutes)))
         a.setdefault("on", False)
         self.auto = a
-        store.push_soon("auto", a)
+        store.push_soon(self._k("auto"), a)
 
     async def _auto_loop(self) -> None:
         while True:
@@ -432,7 +448,7 @@ class HydraEngine:
         remaining = self._auto_remaining()
         if not remaining:
             self.auto = {"on": False, "interval": a.get("interval", 30)}
-            store.push_soon("auto", self.auto)
+            store.push_soon(self._k("auto"), self.auto)
             self.note("ok", "Auto-send finished — everyone in the selection has been DMed. ✅")
             self.emit("status", **self.snapshot())
             return
@@ -442,7 +458,7 @@ class HydraEngine:
         except Exception as exc:
             self.note("warn", f"Auto-send pass: {_err_name(exc)}")
         a["next"] = time.time() + int(a.get("interval", 30) or 30) * 60
-        store.push_soon("auto", a)
+        store.push_soon(self._k("auto"), a)
         self.emit("status", **self.snapshot())
 
     # ── auth ────────────────────────────────────────────────
@@ -513,7 +529,7 @@ class HydraEngine:
                 "creds",
                 {"api_id": self.api_id, "api_hash": self.api_hash, "phone": self.phone},
             )
-            store.push_soon("session", self.client.session.save())
+            store.push_soon(self._k("session"), self.client.session.save())
         await self._mark_online()
         await self._restore_state()
         self.note("ok", f"Session live as {self.me.get('name') if self.me else '?'}.")
@@ -535,11 +551,11 @@ class HydraEngine:
         self.me = None
         self.phase = "logged_out"
         self.armed.clear()
-        if SESSION_PATH.exists():
-            SESSION_PATH.unlink()
-        store.push_soon("session", None)
-        store.push_soon("creds", None)
-        store.push_soon("armed", None)
+        if self.session_path.exists():
+            self.session_path.unlink()
+        store.push_soon(self._k("session"), None)
+        store.push_soon(self._k("creds"), None)
+        store.push_soon(self._k("armed"), None)
         self.armed = []
         self.note("ok", "Session closed.")
         self.emit("status", **self.snapshot())
@@ -702,7 +718,6 @@ class HydraEngine:
             # page means we are done. Stopping early truncated lists at ~199.
             if pages % 25 == 0:
                 self.note("ok", f"Loading requests… {len(people)} so far")
-            await asyncio.sleep(0.05)
 
         self.note("ok", f"Loaded {len(people)} pending join requests (not approved, not declined).")
         return people
@@ -715,6 +730,8 @@ class HydraEngine:
         label: str,
         user_ids: list[int],
         commit: Optional[Callable[[list[tuple[str, Any]]], None]] = None,
+        burst: Optional[int] = None,
+        pace: Optional[float] = None,
     ) -> list[tuple[str, Any]]:
         """Issue many TL requests in MTProto containers instead of a slow serial loop.
 
@@ -722,17 +739,19 @@ class HydraEngine:
         container so callers can persist progress mid-job (crash-safe)."""
         client = self._need()
         results: list[tuple[str, Any]] = [("pending", None)] * len(requests)
+        chunk_size = int(burst or BURST)
+        pace_s = float(pace if pace is not None else BURST_PACE)
 
         flood_sleep_total = 0
         aborted: Optional[str] = None
 
-        for start in range(0, len(requests), BURST):
+        for start in range(0, len(requests), chunk_size):
             if job.cancel_requested:
                 aborted = "Cancelled — the rest are kept for retry."
                 break
-            chunk = requests[start : start + BURST]
-            ids = user_ids[start : start + BURST]
-            job.detail = f"{label} · container {start // BURST + 1}/{(len(requests) - 1) // BURST + 1}"
+            chunk = requests[start : start + chunk_size]
+            ids = user_ids[start : start + chunk_size]
+            job.detail = f"{label} · container {start // chunk_size + 1}/{(len(requests) - 1) // chunk_size + 1}"
             self.emit("job", job=job.as_dict())
 
             # Indices into `chunk` not yet resolved (ok / err / skipped).
@@ -847,8 +866,8 @@ class HydraEngine:
                     commit(results)
                 except Exception:
                     pass
-            if start + BURST < len(requests):
-                await asyncio.sleep(BURST_PACE)
+            if start + chunk_size < len(requests):
+                await asyncio.sleep(pace_s)
 
         # Anything never attempted is "skipped", not failed — callers keep them
         # armed / know they can be retried once Telegram relaxes the limit.
@@ -972,7 +991,13 @@ class HydraEngine:
                 self._persist_armed()
 
             results = await self._burst(
-                requests, job, "arm drafts", [t.user_id for t in targets], commit=commit
+                requests,
+                job,
+                "arm drafts",
+                [t.user_id for t in targets],
+                commit=commit,
+                burst=ARM_BURST,
+                pace=ARM_PACE,
             )
 
             armed: list[ArmedTarget] = []
@@ -1248,4 +1273,156 @@ class HydraEngine:
         return [asdict(t) | {"message": t.message[:80]} for t in self.armed]
 
 
-engine = HydraEngine()
+class EnginePool:
+    """All connected account sessions. The module-level `engine` proxy
+    forwards to the active one, so existing code keeps working."""
+
+    def __init__(self) -> None:
+        self.engines: dict[str, HydraEngine] = {}
+        self.order: list[str] = []
+        self.active_key: Optional[str] = None
+
+    # ── roster ───────────────────────────────────────────────
+    def _register(self, key: str, eng: HydraEngine, make_active: bool = True) -> None:
+        self.engines[key] = eng
+        if key not in self.order:
+            self.order.append(key)
+        if make_active or self.active_key is None:
+            self.active_key = key
+        self.persist_meta()
+
+    def persist_meta(self) -> None:
+        store.push_soon("pool", {"keys": list(self.order), "active": self.active_key})
+
+    def active(self) -> HydraEngine:
+        eng = self.engines.get(self.active_key or "")
+        if eng is None and self.order:
+            eng = self.engines[self.order[0]]
+            self.active_key = self.order[0]
+        if eng is None:
+            eng = HydraEngine("__none__")  # blank placeholder until a session exists
+        return eng
+
+    def ensure_active(self) -> HydraEngine:
+        """Active engine, creating an empty 'main' slot if the pool is empty."""
+        if self.engines:
+            return self.active()
+        eng = HydraEngine("main")
+        self._register("main", eng)
+        return eng
+
+    def summary(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for k in self.order:
+            e = self.engines.get(k)
+            if e is None:
+                continue
+            out.append(
+                {
+                    "key": k,
+                    "active": k == self.active_key,
+                    "phase": e.phase,
+                    "me": e.me,
+                    "armed": len(e.armed),
+                    "auto": bool((e.auto or {}).get("on")),
+                }
+            )
+        return out
+
+    # ── lifecycle ────────────────────────────────────────────
+    def new_login(self) -> HydraEngine:
+        """Fresh blank engine for the login wizard; adopt() keys it after."""
+        return HydraEngine("tmp" + str(int(time.time() * 1000) % 100_000_000))
+
+    async def adopt(self, eng: HydraEngine) -> str:
+        """Give a freshly-logged-in engine its final key and register it."""
+        temp = eng.skey
+        me = eng.me or {}
+        key = "s" + str(me.get("id") or eng.phone or int(time.time()))
+        if key in self.engines:
+            old = self.engines.pop(key)
+            if key in self.order:
+                self.order.remove(key)
+            try:
+                await old.logout()
+            except Exception:
+                pass
+        eng.skey = key
+        eng.creds_path = DATA / f"creds-{key}.json"
+        eng.session_path = DATA / f"session-{key}.string"
+        eng._write_creds()
+        eng._write_session_string()
+        store.push_soon(eng._k("armed_uid"), (me or {}).get("id"))
+        store.push_soon(eng._k("armed"), [])
+        store.push_soon(eng._k("sent"), {"uid": (me or {}).get("id"), "ids": []})
+        store.push_soon(eng._k("auto"), {"on": False, "interval": 30})
+        # purge temp keys from the store
+        if temp != key:
+            for name in ("creds", "session", "armed", "armed_uid", "sent", "dir", "auto"):
+                store.push_soon(f"{temp}:{name}", None)
+        self._register(key, eng)
+        return key
+
+    async def switch(self, key: str) -> bool:
+        if key not in self.engines:
+            return False
+        self.active_key = key
+        self.persist_meta()
+        return True
+
+    def forget(self, key: str) -> None:
+        """Deregister without touching the (already logged-out) engine."""
+        if key in self.engines:
+            del self.engines[key]
+        if key in self.order:
+            self.order.remove(key)
+        if self.active_key == key:
+            self.active_key = self.order[0] if self.order else None
+        self.persist_meta()
+
+    async def remove(self, key: str) -> None:
+        eng = self.engines.get(key)
+        if eng is None:
+            self.forget(key)
+            return
+        try:
+            await eng.logout()
+        except Exception:
+            pass
+        self.forget(key)
+
+    async def bootstrap(self) -> None:
+        """Restore every stored session at boot (legacy data becomes 'main')."""
+        meta = await store.get("pool") or {}
+        keys = list(meta.get("keys") or [])
+        main = HydraEngine("main")
+        await main.try_resume()
+        if main.phase == "ready":
+            self._register("main", main, make_active=(meta.get("active") == "main"))
+        for k in keys:
+            if k == "main":
+                continue
+            e = HydraEngine(k)
+            try:
+                await e.try_resume()
+            except Exception:
+                pass
+            if e.phase == "ready":
+                self._register(k, e, make_active=(meta.get("active") == k))
+        if self.active_key is None and self.order:
+            self.active_key = self.order[0]
+            self.persist_meta()
+
+
+class _EngineProxy:
+    """Forwards attribute access to the active engine."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(pool.active(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(pool.active(), name, value)
+
+
+pool = EnginePool()
+engine = _EngineProxy()
