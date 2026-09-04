@@ -239,6 +239,7 @@ class HydraEngine:
             if await self.client.is_user_authorized():
                 await self._mark_online()
                 self.note("ok", "Resumed existing session.")
+                await self._restore_armed()
             else:
                 await self.client.disconnect()
                 self.client = None
@@ -247,6 +248,16 @@ class HydraEngine:
             self.note("warn", f"Could not resume session: {_err_name(exc)}")
             self.client = None
             self.phase = "logged_out"
+
+    async def _restore_armed(self) -> None:
+        """Rebuild the armed-draft list from the state store (survives restarts)."""
+        try:
+            raw = await store.get("armed") or []
+            self.armed = [ArmedTarget(**a) for a in raw]
+        except Exception:
+            self.armed = []
+        if self.armed:
+            self.note("ok", f"Restored {len(self.armed)} armed drafts — Send all drafts to resume them.")
 
     # ── auth ────────────────────────────────────────────────
     async def start_login(self, api_id: int, api_hash: str, phone: str) -> dict[str, Any]:
@@ -341,6 +352,8 @@ class HydraEngine:
             SESSION_PATH.unlink()
         store.push_soon("session", None)
         store.push_soon("creds", None)
+        store.push_soon("armed", None)
+        self.armed = []
         self.note("ok", "Session closed.")
         self.emit("status", **self.snapshot())
 
@@ -498,83 +511,107 @@ class HydraEngine:
             ids = user_ids[start : start + BURST]
             job.detail = f"{label} · container {start // BURST + 1}/{(len(requests) - 1) // BURST + 1}"
             self.emit("job", job=job.as_dict())
-            packed_ok = False
-            flood_tries = 0
-            while not packed_ok and not aborted:
+
+            # Indices into `chunk` not yet resolved (ok / err / skipped).
+            pending = list(range(len(chunk)))
+            tries = 0
+            while pending and not aborted:
+                tries += 1
                 try:
-                    raw = await client(chunk)
+                    raw = await client([chunk[i] for i in pending])
                     if not isinstance(raw, list):
                         raw = [raw]
-                    for i, item in enumerate(raw):
-                        results[start + i] = ("ok", item)
+                    for k, item in zip(pending, raw):
+                        results[start + k] = ("ok", item)
                         job.ok += 1
-                    packed_ok = True
+                    pending = []
                 except MultiError as exc:
-                    packed_ok = True
-                    for i, (err, item) in enumerate(zip(exc.exceptions, exc.results)):
-                        uid = ids[i] if i < len(ids) else 0
+                    retry: list[int] = []
+                    max_wait = 0
+                    for i, err in enumerate(exc.exceptions):
+                        k = pending[i] if i < len(pending) else None
+                        if k is None:
+                            continue
                         if err is None:
-                            results[start + i] = ("ok", item)
+                            results[start + k] = ("ok", exc.results[i])
                             job.ok += 1
+                        elif isinstance(err, FloodWaitError):
+                            # Per-item flood: retry just these after a pause.
+                            retry.append(k)
+                            max_wait = max(max_wait, int(getattr(err, "seconds", 1) or 1))
                         else:
-                            results[start + i] = ("err", err)
+                            results[start + k] = ("err", err)
                             job.fail += 1
-                            job.errors.append({"user_id": uid, "error": _err_name(err)})
-                except FloodWaitError as exc:
-                    wait = int(getattr(exc, "seconds", 1) or 1)
-                    flood_tries += 1
-                    flood_sleep_total += wait
+                            job.errors.append({"user_id": ids[k], "error": _err_name(err)})
+                    if not retry:
+                        pending = []
+                        break
                     if (
-                        wait > FLOOD_SLEEP_CAP
-                        or flood_sleep_total > FLOOD_TOTAL_SLEEP_CAP
-                        or flood_tries >= FLOOD_MAX_TRIES
+                        tries >= FLOOD_MAX_TRIES
+                        or max_wait > FLOOD_SLEEP_CAP
+                        or flood_sleep_total + max_wait > FLOOD_TOTAL_SLEEP_CAP
                     ):
                         aborted = (
-                            f"Telegram demands a {wait}s break — paused with {job.ok} done. "
-                            "The rest are kept; retry later."
+                            f"Telegram demands a break ({max_wait}s+) — paused with {job.ok} done. "
+                            "The rest are kept; retry in a few hours."
                         )
                         break
+                    flood_sleep_total += max_wait
                     job.detail = (
-                        f"Telegram flood wait {wait}s — auto-resuming, "
+                        f"Flood wait {max_wait}s on {len(retry)} items — auto-resuming, "
                         f"{job.ok}/{len(requests)} done"
                     )
+                    self.emit("job", job=job.as_dict())
+                    self.note("warn", f"Flood wait {max_wait}s during {label}; resuming automatically.")
+                    await asyncio.sleep(max_wait + 1)
+                    pending = retry
+                except FloodWaitError as exc:
+                    # Whole container rejected: nothing executed, safe to retry all.
+                    wait = int(getattr(exc, "seconds", 1) or 1)
+                    if (
+                        tries >= FLOOD_MAX_TRIES
+                        or wait > FLOOD_SLEEP_CAP
+                        or flood_sleep_total + wait > FLOOD_TOTAL_SLEEP_CAP
+                    ):
+                        aborted = (
+                            f"Telegram demands a break ({wait}s) — paused with {job.ok} done. "
+                            "The rest are kept; retry in a few hours."
+                        )
+                        break
+                    flood_sleep_total += wait
+                    job.detail = f"Telegram flood wait {wait}s — auto-resuming, {job.ok}/{len(requests)} done"
                     self.emit("job", job=job.as_dict())
                     self.note("warn", f"Flood wait {wait}s during {label}; resuming automatically.")
                     await asyncio.sleep(wait + 1)
                 except Exception as exc:
                     self.note("warn", f"Container failed ({_err_name(exc)}); retrying peers one by one.")
-                    break
-
-            if not packed_ok and not aborted:
-                for i, req in enumerate(chunk):
-                    if results[start + i][0] != "pending":
-                        continue
-                    try:
-                        item = await client(req)
-                        results[start + i] = ("ok", item)
-                        job.ok += 1
-                    except FloodWaitError as exc:
-                        wait = int(getattr(exc, "seconds", 1) or 1)
-                        if wait > FLOOD_SLEEP_CAP:
-                            aborted = (
-                                f"Telegram demands a {wait}s break — paused with {job.ok} done. "
-                                "The rest are kept; retry later."
-                            )
-                            break
-                        self.note("warn", f"Flood wait {wait}s on user {ids[i]}.")
-                        await asyncio.sleep(wait + 1)
+                    for k in pending:
                         try:
-                            item = await client(req)
-                            results[start + i] = ("ok", item)
+                            item = await client(chunk[k])
+                            results[start + k] = ("ok", item)
                             job.ok += 1
+                        except FloodWaitError as fw:
+                            wait = int(getattr(fw, "seconds", 1) or 1)
+                            if wait > FLOOD_SLEEP_CAP:
+                                aborted = (
+                                    f"Telegram demands a break ({wait}s) — paused with {job.ok} done. "
+                                    "The rest are kept; retry in a few hours."
+                                )
+                                break
+                            await asyncio.sleep(wait + 1)
+                            try:
+                                item = await client(chunk[k])
+                                results[start + k] = ("ok", item)
+                                job.ok += 1
+                            except Exception as exc2:
+                                results[start + k] = ("err", exc2)
+                                job.fail += 1
+                                job.errors.append({"user_id": ids[k], "error": _err_name(exc2)})
                         except Exception as exc2:
-                            results[start + i] = ("err", exc2)
+                            results[start + k] = ("err", exc2)
                             job.fail += 1
-                            job.errors.append({"user_id": ids[i], "error": _err_name(exc2)})
-                    except Exception as exc:
-                        results[start + i] = ("err", exc)
-                        job.fail += 1
-                        job.errors.append({"user_id": ids[i], "error": _err_name(exc)})
+                            job.errors.append({"user_id": ids[k], "error": _err_name(exc2)})
+                    pending = []
 
             if aborted:
                 break
@@ -658,6 +695,7 @@ class HydraEngine:
             # Replace previous arm for these users, keep others.
             keep_ids = {t.user_id for t in armed}
             self.armed = [a for a in self.armed if a.user_id not in keep_ids] + armed
+            store.push_soon("armed", [asdict(a) for a in self.armed])
 
             job.status = "done"
             job.detail = f"Drafts written in {job.ok} DMs (unsent)"
@@ -682,8 +720,10 @@ class HydraEngine:
 
             # Prefer the text actually sitting in the account drafts.
             draft_text: dict[int, str] = {}
+            drafts_read = False
             try:
                 updates = await client(GetAllDraftsRequest())
+                drafts_read = True
                 for upd in getattr(updates, "updates", []) or []:
                     if not isinstance(upd, UpdateDraftMessage):
                         continue
@@ -693,6 +733,23 @@ class HydraEngine:
                         draft_text[peer.user_id] = draft.message
             except Exception as exc:
                 self.note("warn", f"Could not read live drafts, using armed copy: {_err_name(exc)}")
+
+            if drafts_read:
+                # A target whose live draft vanished was already sent or
+                # cleared elsewhere — firing at it would duplicate the DM.
+                before = len(targets)
+                targets = [t for t in targets if t.user_id in draft_text]
+                dropped = before - len(targets)
+                if dropped:
+                    self.note("ok", f"{dropped} drafts already sent or cleared — skipping them.")
+                if not targets:
+                    self.armed = []
+                    store.push_soon("armed", [])
+                    job.status = "done"
+                    job.detail = "Nothing to send — every draft was already sent or cleared."
+                    self.emit("job", job=job.as_dict())
+                    self.emit("status", **self.snapshot())
+                    return {"job": job.as_dict(), "armed": 0}
 
             requests = []
             for t in targets:
@@ -712,6 +769,7 @@ class HydraEngine:
             # Keep every target that did not go out (failed or flood-skipped)
             # armed, so "Send all drafts" can resume them later.
             self.armed = [t for t, (status, _) in zip(targets, results) if status != "ok"]
+            store.push_soon("armed", [asdict(a) for a in self.armed])
 
             job.status = "done"
             job.detail = f"Sent {job.ok} · failed {job.fail}"
@@ -769,6 +827,7 @@ class HydraEngine:
             ]
             await self._burst(requests, job, "clear drafts", [t.user_id for t in targets])
             self.armed = []
+            store.push_soon("armed", [])
             job.status = "done"
             job.detail = "Drafts cleared"
             self.emit("job", job=job.as_dict())
