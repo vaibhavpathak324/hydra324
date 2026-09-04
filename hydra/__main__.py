@@ -8,7 +8,7 @@ import uvicorn
 def main() -> None:
     parser = argparse.ArgumentParser(prog="hydra")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
     parser.add_argument(
         "--bot-token",
         default=os.environ.get("HYDRA_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or "",

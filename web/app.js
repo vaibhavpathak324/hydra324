@@ -411,6 +411,12 @@ async function boot() {
   connectWs();
   const s = await api("/api/status");
   applyStatus(s);
+  if (s.defaults && s.defaults.api_id && !$("api_id").value) {
+    $("api_id").value = s.defaults.api_id;
+    $("api_hash").value = s.defaults.api_hash || "";
+    $("s_api_id").value = s.defaults.api_id;
+    $("s_api_hash").value = s.defaults.api_hash || "";
+  }
   applyBot(s.bot || (await api("/api/bot")));
   if (s.phase === "ready") await bootApp();
 }

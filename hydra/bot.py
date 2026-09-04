@@ -33,6 +33,7 @@ from telegram.ext import (
     filters,
 )
 
+from hydra import store
 from hydra.engine import DATA, engine
 from hydra.panel import esc, render
 
@@ -142,6 +143,8 @@ class BotController:
         if self.username:
             raw["username"] = self.username
         BOT_PATH.write_text(json.dumps(raw))
+        # Mirror to the state store so the token/owner survive restarts.
+        store.push_soon("bot", raw)
 
     def status(self) -> dict[str, Any]:
         return {
@@ -168,6 +171,9 @@ class BotController:
 
     # ── lifecycle ───────────────────────────────────────────
     async def start(self, token: Optional[str] = None) -> dict[str, Any]:
+        if not BOT_PATH.exists():
+            # Ephemeral filesystem: restore token/owner from the state store.
+            await store.pull_to_file("bot", BOT_PATH)
         token = (token or os.environ.get("HYDRA_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or self._load().get("token") or "").strip()
         if not token or ":" not in token:
             return {"running": False, "detail": "No bot token yet."}
@@ -177,6 +183,10 @@ class BotController:
             await self.stop()
 
         stored = self._load()
+        if not stored.get("owner_id"):
+            env_owner = (os.environ.get("OWNER_ID") or os.environ.get("HYDRA_OWNER_ID") or "").strip()
+            if env_owner.isdigit():
+                stored["owner_id"] = int(env_owner)
         self.token = token
         self.owner_id = stored.get("owner_id")
         self.application = (
@@ -441,6 +451,11 @@ class BotController:
 
         if data == "sess:phone":
             self.ws.login = {}
+            env_api_id = (os.environ.get("TELEGRAM_API_ID") or os.environ.get("API_ID") or "").strip()
+            env_api_hash = (os.environ.get("TELEGRAM_API_HASH") or os.environ.get("API_HASH") or "").strip()
+            if env_api_id.isdigit() and env_api_hash:
+                self.ws.login = {"api_id": env_api_id, "api_hash": env_api_hash}
+                return self._ask("phone", "session")
             return self._ask("api_id", "session")
         if data == "sess:string":
             self.ws.login = {}

@@ -25,6 +25,8 @@ from telethon.errors import (
     UserPrivacyRestrictedError,
 )
 from telethon.sessions import StringSession
+
+from hydra import store
 from telethon.tl.functions.messages import (
     GetAllDraftsRequest,
     GetChatInviteImportersRequest,
@@ -208,6 +210,11 @@ class HydraEngine:
 
     async def try_resume(self) -> None:
         if not CREDS_PATH.exists() or not SESSION_PATH.exists():
+            # Ephemeral filesystem (e.g. Render free tier): restore from the
+            # Supabase state store before giving up.
+            await store.pull_to_file("creds", CREDS_PATH)
+            await store.pull_to_file("session", SESSION_PATH)
+        if not CREDS_PATH.exists() or not SESSION_PATH.exists():
             return
         try:
             creds = json.loads(CREDS_PATH.read_text())
@@ -293,6 +300,13 @@ class HydraEngine:
 
     async def _after_sign_in(self) -> None:
         self._write_session_string()
+        # Mirror session + creds to the state store so restarts can resume.
+        if store.enabled() and self.client:
+            store.push_soon(
+                "creds",
+                {"api_id": self.api_id, "api_hash": self.api_hash, "phone": self.phone},
+            )
+            store.push_soon("session", self.client.session.save())
         await self._mark_online()
         self.note("ok", f"Session live as {self.me.get('name') if self.me else '?'}.")
         self.emit("status", **self.snapshot())
@@ -315,6 +329,8 @@ class HydraEngine:
         self.armed.clear()
         if SESSION_PATH.exists():
             SESSION_PATH.unlink()
+        store.push_soon("session", None)
+        store.push_soon("creds", None)
         self.note("ok", "Session closed.")
         self.emit("status", **self.snapshot())
 

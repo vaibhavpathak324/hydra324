@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from hydra import store
 from hydra.bot import controller
 from hydra.engine import DATA, engine
 
@@ -22,6 +24,7 @@ WEB = Path(__file__).resolve().parent.parent / "web"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     DATA.mkdir(parents=True, exist_ok=True)
+    await store.init()
     await engine.try_resume()
     try:
         await controller.start()
@@ -96,6 +99,10 @@ async def index():
 async def status():
     snap = engine.snapshot()
     snap["bot"] = controller.status()
+    snap["defaults"] = {
+        "api_id": (os.environ.get("TELEGRAM_API_ID") or os.environ.get("API_ID") or "").strip(),
+        "api_hash": (os.environ.get("TELEGRAM_API_HASH") or os.environ.get("API_HASH") or "").strip(),
+    }
     return snap
 
 
