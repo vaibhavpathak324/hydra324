@@ -1,0 +1,5 @@
+telethon==1.38.1
+fastapi==0.115.6
+uvicorn==0.34.0
+websockets==14.1
+python-telegram-bot==21.10

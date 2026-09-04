@@ -1,0 +1,416 @@
+from __future__ import annotations
+
+import html
+from typing import Any, Optional
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+CHATS_PER = 6
+PEOPLE_PER = 8
+
+
+def esc(s: Any) -> str:
+    return html.escape("" if s is None else str(s), quote=False)
+
+
+def clip(s: str, n: int = 36) -> str:
+    s = (s or "").replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def B(text: str, data: Optional[str] = None, url: Optional[str] = None) -> InlineKeyboardButton:
+    if url:
+        return InlineKeyboardButton(clip(text, 60), url=url)
+    return InlineKeyboardButton(clip(text, 60), callback_data=data or "nop")
+
+
+def kb(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(rows)
+
+
+def nav(back: Optional[str] = None) -> list[InlineKeyboardButton]:
+    row: list[InlineKeyboardButton] = []
+    if back:
+        row.append(B("← Back", back))
+    row.append(B("Home", "go:home"))
+    return row
+
+
+def bar(done: int, total: int, width: int = 12) -> str:
+    if total <= 0:
+        return "░" * width
+    fill = int(round(width * min(max(done, 0), total) / total))
+    return "█" * fill + "░" * (width - fill)
+
+
+def preview_msg(text: str, n: int = 140) -> str:
+    t = (text or "").strip() or "— not set —"
+    t = clip(t, n)
+    return f"<code>{esc(t)}</code>"
+
+
+def session_line(engine) -> str:
+    if engine.phase == "ready" and engine.me:
+        u = engine.me
+        handle = f" @{esc(u['username'])}" if u.get("username") else ""
+        return f"● <b>{esc(u.get('name'))}</b>{handle}"
+    if engine.phase == "awaiting_code":
+        return "○ waiting for login code"
+    if engine.phase == "awaiting_password":
+        return "○ waiting for 2FA password"
+    return "○ no session"
+
+
+def render(engine, ws, bot_username: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    screen = ws.screen
+    fn = {
+        "home": home,
+        "session": session,
+        "chats": chats,
+        "reqs": reqs,
+        "msg": message,
+        "btns": buttons,
+        "act": actions,
+        "post": post,
+        "log": logs,
+        "set": settings,
+        "wait": wait,
+        "confirm": confirm,
+        "job": job,
+    }.get(screen, home)
+    return fn(engine, ws, bot_username)
+
+
+def home(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    chat = ws.selected_chat
+    chat_s = esc(chat["title"]) if chat else "none selected"
+    n_sel = len(ws.selected_ids)
+    n_ppl = len(ws.people)
+    n_btn = sum(len(r) for r in ws.buttons)
+    text = (
+        "<b>HYDRA 324</b>\n"
+        "<i>tap buttons — don’t type commands</i>\n\n"
+        f"Session     {session_line(engine)}\n"
+        f"Chat        {chat_s}\n"
+        f"Requests    {n_ppl} loaded · {n_sel} selected\n"
+        f"Drafts      {len(engine.armed)} armed\n"
+        f"Message     {preview_msg(ws.message, 90)}\n"
+        f"Buttons     {len(ws.buttons)} row · {n_btn} links\n"
+    )
+    rows = [
+        [B("Session", "go:session"), B("Chats", "go:chats")],
+        [B("Requests", "go:reqs"), B("Message", "go:msg")],
+        [B("Buttons", "go:btns"), B("Actions", "go:act")],
+        [B("Post", "go:post"), B("Log", "go:log")],
+        [B("Settings", "go:set")],
+    ]
+    return text, kb(rows)
+
+
+def session(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    extra = ""
+    if engine.phase == "ready" and engine.me:
+        extra = (
+            f"\nLogged in as {session_line(engine)}\n"
+            f"Phone {esc(engine.me.get('phone') or '—')}\n"
+        )
+    text = (
+        "<b>Account session</b>\n\n"
+        "The control bot is only the remote. "
+        "Join requests and DMs run on a <b>user session</b>.\n"
+        f"{extra}\n"
+        f"Status: <code>{esc(engine.phase)}</code>"
+    )
+    rows = [
+        [B("Connect with phone", "sess:phone")],
+        [B("Paste session string", "sess:string")],
+        [B("Export session", "sess:export")],
+        [B("Log out session", "act:logout")],
+        nav(),
+    ]
+    return text, kb(rows)
+
+
+def chats(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    rows_data = ws.visible_chats()
+    page = ws.chat_page
+    start = page * CHATS_PER
+    chunk = rows_data[start : start + CHATS_PER]
+    filt = f"\nFilter: <code>{esc(ws.chat_filter)}</code>" if ws.chat_filter else ""
+    text = (
+        "<b>Joined groups & channels</b>\n"
+        f"{len(rows_data)} chats{filt}\n"
+        "Tap one to work on it."
+    )
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, c in enumerate(chunk):
+        idx = start + i
+        mark = "● " if ws.selected_chat and c["id"] == ws.selected_chat["id"] else ""
+        pending = "" if c.get("pending") is None else f" · {c['pending']} pending"
+        admin = " · admin" if c.get("admin") else ""
+        rows.append([B(f"{mark}{c['title']}{pending}", f"ch:{idx}")])
+        # second line as small meta isn't possible; encode in title
+        _ = admin
+    navrow: list[InlineKeyboardButton] = []
+    if page > 0:
+        navrow.append(B("◀", f"chats:p:{page - 1}"))
+    navrow.append(B(f"{page + 1}/{(max(len(rows_data) - 1, 0) // CHATS_PER) + 1}", "nop"))
+    if start + CHATS_PER < len(rows_data):
+        navrow.append(B("▶", f"chats:p:{page + 1}"))
+    rows.append(navrow)
+    rows.append([B("Reload", "chats:load"), B("Scan pending", "chats:scan")])
+    rows.append([B("Filter", "chats:filter")])
+    rows.append(nav("go:home"))
+    return text, kb(rows)
+
+
+def reqs(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    if not ws.selected_chat:
+        text = "<b>Join requests</b>\n\nSelect a group or channel first. Requests are never approved or declined."
+        return text, kb([[B("Open chats", "go:chats")], nav()])
+    people = ws.visible_people()
+    page = ws.people_page
+    start = page * PEOPLE_PER
+    chunk = people[start : start + PEOPLE_PER]
+    title = esc(ws.selected_chat["title"])
+    text = (
+        f"<b>Join requests</b>\n{title}\n"
+        f"{len(ws.people)} pending · {len(ws.selected_ids)} selected"
+        "\n<i>Read only — HYDRA does not accept or decline.</i>"
+    )
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, p in enumerate(chunk):
+        idx = start + i
+        on = "☑" if p["id"] in ws.selected_ids else "☐"
+        uname = f" @{p['username']}" if p.get("username") else ""
+        rows.append([B(f"{on}  {p['name']}{uname}", f"rq:{idx}")])
+    navrow: list[InlineKeyboardButton] = []
+    last_page = max(len(people) - 1, 0) // PEOPLE_PER
+    if page > 0:
+        navrow.append(B("◀", f"reqs:p:{page - 1}"))
+    navrow.append(B(f"{page + 1}/{last_page + 1}", "nop"))
+    if start + PEOPLE_PER < len(people):
+        navrow.append(B("▶", f"reqs:p:{page + 1}"))
+    rows.append(navrow)
+    rows.append([B("Select all", "reqs:all"), B("Select none", "reqs:none")])
+    rows.append([B("Reload", "reqs:load"), B("Filter", "reqs:filter")])
+    rows.append(nav("go:chats"))
+    return text, kb(rows)
+
+
+def message(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    body = ws.message.strip() if ws.message else ""
+    shown = esc(body) if body else "<i>empty</i>"
+    text = (
+        "<b>Message</b>\n\n"
+        "This is the copy used for DMs, drafts, and posts.\n\n"
+        f"{shown}"
+    )
+    rows = [
+        [B("Set message", "msg:set")],
+        [B("Clear", "msg:clear")],
+        [B("Edit buttons", "go:btns")],
+        nav(),
+    ]
+    return text, kb(rows)
+
+
+def buttons(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    if not ws.buttons:
+        layout = "<i>no buttons yet</i>"
+    else:
+        lines = []
+        for i, row in enumerate(ws.buttons, 1):
+            bits = " · ".join(f"{esc(b['text'])}" for b in row)
+            lines.append(f"{i}. {bits}")
+        layout = "\n".join(lines)
+    text = (
+        "<b>Inline buttons</b>\n\n"
+        "URL buttons attached to posts the session sends "
+        "(via this bot’s inline mode) or that this bot posts itself.\n\n"
+        f"{layout}"
+    )
+    rows = [
+        [B("Add URL button", "btn:add")],
+        [B("New row", "btn:row"), B("Remove last", "btn:del")],
+        [B("Clear all", "btn:clr")],
+        [B("Preview", "post:preview")],
+        nav(),
+    ]
+    return text, kb(rows)
+
+
+def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    n = len(ws.selected_people())
+    text = (
+        "<b>Actions</b>\n\n"
+        f"Selected requesters: <b>{n}</b>\n"
+        f"Armed drafts: <b>{len(engine.armed)}</b>\n\n"
+        "Write drafts fills each DM compose box and does <b>not</b> send.\n"
+        "Send all drafts is the one-click release."
+    )
+    rows = [
+        [B("Write drafts — don’t send", "act:arm")],
+        [B("Send all drafts", "act:fire")],
+        [B("Send DMs now", "act:send")],
+        [B("Send DMs with buttons", "act:inlinedm")],
+        [B("Clear drafts", "act:disarm")],
+        nav(),
+    ]
+    return text, kb(rows)
+
+
+def post(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    target = esc(ws.selected_chat["title"]) if ws.selected_chat else "none — pick a chat first"
+    bot = f"@{esc(bot_username)}" if bot_username else "this bot"
+    n_btn = sum(len(r) for r in ws.buttons)
+    text = (
+        "<b>Post</b>\n\n"
+        f"Target    {target}\n"
+        f"Buttons   {n_btn}\n"
+        f"Copy      {preview_msg(ws.message, 80)}\n\n"
+        "A user session cannot attach inline keyboards by itself. "
+        f"HYDRA posts button messages <b>as the session</b> through {bot} "
+        "inline mode (<code>hide_via</code>), so it still looks like your account.\n\n"
+        "Turn on Inline Mode for this bot in @BotFather if you have not."
+    )
+    rows = [
+        [B("Preview in this chat", "post:preview")],
+        [B("Post as session + buttons", "act:postinline")],
+        [B("Post as session, text only", "act:postsession")],
+        [B("Post as this bot + buttons", "act:postbot")],
+        [B("Pick a chat", "go:chats")],
+        nav(),
+    ]
+    return text, kb(rows)
+
+
+def logs(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    items = list(engine.logs)[-12:]
+    if not items:
+        body = "<i>nothing yet</i>"
+    else:
+        lines = []
+        for e in reversed(items):
+            t = (e.get("ts") or "")[11:19]
+            lines.append(f"<code>{esc(t)}</code> {esc(e.get('text'))}")
+        body = "\n".join(lines)
+    text = f"<b>Log</b>\n\n{body}"
+    return text, kb([[B("Refresh", "go:log")], nav()])
+
+
+def settings(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    bot = f"@{esc(bot_username)}" if bot_username else "—"
+    text = (
+        "<b>Settings</b>\n\n"
+        f"Control bot    {bot}\n"
+        f"Session        {session_line(engine)}\n\n"
+        "This bot only answers the first Telegram account that opens it "
+        "(the owner). Everyone else is ignored.\n\n"
+        "Inline mode: @BotFather → your bot → Bot Settings → Inline Mode → On.\n"
+        "Placeholder can be <code>hydra</code>."
+    )
+    rows = [
+        [B("Refresh panel", "go:home")],
+        [B("Export session", "sess:export")],
+        nav(),
+    ]
+    return text, kb(rows)
+
+
+def wait(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    prompts = {
+        "api_id": ("Connect session", "1 / 4 · API ID", "Send the API ID as your next message (numbers only)."),
+        "api_hash": ("Connect session", "2 / 4 · API hash", "Send the API hash from my.telegram.org."),
+        "phone": ("Connect session", "3 / 4 · Phone", "Send the phone with country code.\nExample: +447700900123"),
+        "code": ("Connect session", "4 / 4 · Login code", "Send the login code Telegram just delivered."),
+        "password": ("Connect session", "Two-step password", "Send the 2FA password."),
+        "s_api_id": ("Session string", "1 / 3 · API ID", "Send the API ID."),
+        "s_api_hash": ("Session string", "2 / 3 · API hash", "Send the API hash."),
+        "session_string": ("Session string", "3 / 3 · String", "Paste the session string as your next message."),
+        "message": ("Message", "Send copy", "Send the DM / post text as your next message."),
+        "btn_label": ("Add button", "1 / 2 · Label", "Send the button label."),
+        "btn_url": ("Add button", "2 / 2 · URL", "Send the URL, including https://"),
+        "chat_filter": ("Filter chats", "", "Send text to match titles. Send a single dash (-) to clear."),
+        "people_filter": ("Filter people", "", "Send text to match names. Send a single dash (-) to clear."),
+    }
+    title, step, hint = prompts.get(ws.waiting or "", ("HYDRA", "", "Send your next message."))
+    step_l = f"\n{esc(step)}\n" if step else "\n"
+    text = f"<b>{esc(title)}</b>{step_l}\n{esc(hint)}"
+    return text, kb([[B("Cancel", "wait:cancel")], nav()])
+
+
+def confirm(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    action = ws.pending or ""
+    n = len(ws.selected_people())
+    copies = {
+        "arm": (
+            "Write unsent drafts",
+            f"Place the message in <b>{n}</b> requester DMs as drafts. Nothing is sent.",
+            "do:arm",
+        ),
+        "fire": (
+            "Send all drafts",
+            f"Release <b>{len(engine.armed)}</b> armed drafts now.",
+            "do:fire",
+        ),
+        "send": (
+            "Send DMs now",
+            f"Send the message immediately to <b>{n}</b> requesters.",
+            "do:send",
+        ),
+        "inlinedm": (
+            "Send DMs with buttons",
+            f"The session sends the button message to <b>{n}</b> requesters via inline mode.",
+            "do:inlinedm",
+        ),
+        "disarm": (
+            "Clear drafts",
+            f"Erase {len(engine.armed)} armed drafts from DMs.",
+            "do:disarm",
+        ),
+        "logout": (
+            "Log out session",
+            "Disconnect the user session. The control bot stays up.",
+            "do:logout",
+        ),
+        "postinline": (
+            "Post as session + buttons",
+            "The account posts to the selected chat with inline buttons (via this bot, hide via).",
+            "do:postinline",
+        ),
+        "postsession": (
+            "Post as session",
+            "The account posts text only to the selected chat.",
+            "do:postsession",
+        ),
+        "postbot": (
+            "Post as this bot + buttons",
+            "The control bot posts to the selected chat. It must be a member / admin there.",
+            "do:postbot",
+        ),
+    }
+    title, body, yes = copies.get(action, ("Confirm", "Do this?", "go:home"))
+    text = f"<b>{esc(title)}</b>\n\n{body}"
+    rows = [[B("Confirm", yes)], [B("Cancel", "go:home")]]
+    return text, kb(rows)
+
+
+def job(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    j = engine.job
+    if not j:
+        return "<b>Job</b>\n\nNo job running.", kb([nav()])
+    pct = int(round(100 * j.done / j.total)) if j.total else 0
+    text = (
+        f"<b>{esc(j.kind)}</b>\n"
+        f"<code>{bar(j.done, j.total)}</code>  {pct}%\n\n"
+        f"{j.done}/{j.total} · ok {j.ok} · fail {j.fail}\n"
+        f"{esc(j.detail or j.status)}"
+    )
+    if j.errors:
+        bits = ", ".join(f"{e.get('user_id')}:{e.get('error')}" for e in j.errors[-4:])
+        text += f"\n\n<code>{esc(bits)}</code>"
+    rows = [[B("Refresh", "go:job")]]
+    if j.status == "done":
+        rows.append([B("Home", "go:home"), B("Log", "go:log")])
+    return text, kb(rows)
