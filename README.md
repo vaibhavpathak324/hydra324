@@ -45,7 +45,7 @@ API ID + hash for the **session** still come from [my.telegram.org](https://my.t
 5. **Actions** → Write drafts, then Send all drafts. Or Send DMs now.
 6. **Post** → preview, then post as session + buttons to the selected chat.
 
-Telegram may still return `FLOOD_WAIT` or `privacy` on people who block DMs. Those show on the job screen and in the log.
+Telegram may still return `FLOOD_WAIT` or `privacy` on people who block DMs. Those show on the job screen and in the log. Flood policy: short waits are slept off automatically and the job resumes; a single wait over 10 minutes (or repeated waits) pauses the job cleanly — unattempted targets are marked *skipped*, and fired drafts that didn't go out **stay armed** so one tap resumes them later. Telegram hard-limits DMs to non-contacts (roughly 50/day for newer accounts, more for aged ones) — large blasts need multiple sittings a few hours apart.
 
 Session files live in `data/` and are gitignored. The session string is equivalent to the account password.
 
@@ -65,4 +65,4 @@ Build: `pip install -r requirements.txt` · Start: `python -m hydra --port $PORT
 
 Render's free tier has an **ephemeral disk**, so HYDRA mirrors its state (session string, creds, bot token/owner) into the Supabase `hydra_state` table and restores it on every boot — the Telegram session survives restarts and redeploys with no re-login. Use the Supabase **session pooler** (`...pooler.supabase.com:5432`), not the direct `db.*` host: the direct host is IPv6-only and unreachable from most cloud hosts, including Render.
 
-Free web services spin down after ~15 min without HTTP traffic; the control bot stops responding until the service wakes. Any request to the site wakes it again.
+Free web services spin down after ~15 min without HTTP traffic. A GitHub Actions workflow (`.github/workflows/keep-alive.yml`) pings `/api/status` every ~9 minutes to keep the bot responsive around the clock. Note: GitHub disables scheduled workflows after 60 days without a repo commit — push any commit to re-enable it.

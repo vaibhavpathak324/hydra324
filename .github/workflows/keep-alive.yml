@@ -1,0 +1,29 @@
+name: Keep HYDRA awake
+
+# Render's free tier suspends a web service after ~15 minutes without inbound
+# HTTP traffic. This scheduled ping keeps https://hydra324.onrender.com awake
+# 24/7. The generous timeout tolerates cold starts, and a second attempt acts
+# as a safety net. Public repos get unlimited Actions minutes, so this is free.
+
+on:
+  schedule:
+    - cron: "*/9 * * * *" # every ~9 minutes (offset from busy */5 slots)
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping HYDRA status endpoint
+        run: |
+          for attempt in 1 2; do
+            code="$(curl -s -o /dev/null -w "%{http_code}" --max-time 180 https://hydra324.onrender.com/api/status || true)"
+            echo "attempt $attempt: HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "Service is awake."
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::warning::HYDRA did not answer with HTTP 200"
+          exit 1

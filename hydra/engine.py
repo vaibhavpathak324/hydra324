@@ -54,6 +54,14 @@ SESSION_PATH = DATA / "session.string"
 
 # MTProto containers stay reliable around this size even with medium-length copy.
 BURST = 24
+# Flood-wait policy: short waits are slept off and the job resumes on its own.
+# A single wait longer than FLOOD_SLEEP_CAP (or too much total waiting) pauses
+# the job instead of freezing it for hours; unattempted targets are reported
+# as "skipped" and (for fired drafts) stay armed so they can be retried later.
+FLOOD_SLEEP_CAP = 600
+FLOOD_TOTAL_SLEEP_CAP = 1200
+FLOOD_MAX_TRIES = 3
+BURST_PACE = 1.5
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -102,6 +110,7 @@ class Job:
     done: int = 0
     ok: int = 0
     fail: int = 0
+    skipped: int = 0
     status: str = "running"
     detail: str = ""
     errors: list[dict[str, Any]] = field(default_factory=list)
@@ -114,6 +123,7 @@ class Job:
             "done": self.done,
             "ok": self.ok,
             "fail": self.fail,
+            "skipped": self.skipped,
             "status": self.status,
             "detail": self.detail,
             "errors": self.errors[-40:],
@@ -480,48 +490,77 @@ class HydraEngine:
         client = self._need()
         results: list[tuple[str, Any]] = [("pending", None)] * len(requests)
 
+        flood_sleep_total = 0
+        aborted: Optional[str] = None
+
         for start in range(0, len(requests), BURST):
             chunk = requests[start : start + BURST]
             ids = user_ids[start : start + BURST]
             job.detail = f"{label} · container {start // BURST + 1}/{(len(requests) - 1) // BURST + 1}"
             self.emit("job", job=job.as_dict())
             packed_ok = False
-            try:
-                raw = await client(chunk)
-                if not isinstance(raw, list):
-                    raw = [raw]
-                for i, item in enumerate(raw):
-                    results[start + i] = ("ok", item)
-                    job.ok += 1
-                packed_ok = True
-            except MultiError as exc:
-                packed_ok = True
-                for i, (err, item) in enumerate(zip(exc.exceptions, exc.results)):
-                    uid = ids[i] if i < len(ids) else 0
-                    if err is None:
+            flood_tries = 0
+            while not packed_ok and not aborted:
+                try:
+                    raw = await client(chunk)
+                    if not isinstance(raw, list):
+                        raw = [raw]
+                    for i, item in enumerate(raw):
                         results[start + i] = ("ok", item)
                         job.ok += 1
-                    else:
-                        results[start + i] = ("err", err)
-                        job.fail += 1
-                        job.errors.append({"user_id": uid, "error": _err_name(err)})
-            except FloodWaitError as exc:
-                wait = int(getattr(exc, "seconds", 1) or 1)
-                job.detail = f"Telegram flood wait {wait}s — retrying this container"
-                self.emit("job", job=job.as_dict())
-                self.note("warn", f"Flood wait {wait}s during {label}.")
-                await asyncio.sleep(wait + 1)
-            except Exception as exc:
-                self.note("warn", f"Container failed ({_err_name(exc)}); retrying peers in that batch.")
+                    packed_ok = True
+                except MultiError as exc:
+                    packed_ok = True
+                    for i, (err, item) in enumerate(zip(exc.exceptions, exc.results)):
+                        uid = ids[i] if i < len(ids) else 0
+                        if err is None:
+                            results[start + i] = ("ok", item)
+                            job.ok += 1
+                        else:
+                            results[start + i] = ("err", err)
+                            job.fail += 1
+                            job.errors.append({"user_id": uid, "error": _err_name(err)})
+                except FloodWaitError as exc:
+                    wait = int(getattr(exc, "seconds", 1) or 1)
+                    flood_tries += 1
+                    flood_sleep_total += wait
+                    if (
+                        wait > FLOOD_SLEEP_CAP
+                        or flood_sleep_total > FLOOD_TOTAL_SLEEP_CAP
+                        or flood_tries >= FLOOD_MAX_TRIES
+                    ):
+                        aborted = (
+                            f"Telegram demands a {wait}s break — paused with {job.ok} done. "
+                            "The rest are kept; retry later."
+                        )
+                        break
+                    job.detail = (
+                        f"Telegram flood wait {wait}s — auto-resuming, "
+                        f"{job.ok}/{len(requests)} done"
+                    )
+                    self.emit("job", job=job.as_dict())
+                    self.note("warn", f"Flood wait {wait}s during {label}; resuming automatically.")
+                    await asyncio.sleep(wait + 1)
+                except Exception as exc:
+                    self.note("warn", f"Container failed ({_err_name(exc)}); retrying peers one by one.")
+                    break
 
-            if not packed_ok:
+            if not packed_ok and not aborted:
                 for i, req in enumerate(chunk):
+                    if results[start + i][0] != "pending":
+                        continue
                     try:
                         item = await client(req)
                         results[start + i] = ("ok", item)
                         job.ok += 1
                     except FloodWaitError as exc:
                         wait = int(getattr(exc, "seconds", 1) or 1)
+                        if wait > FLOOD_SLEEP_CAP:
+                            aborted = (
+                                f"Telegram demands a {wait}s break — paused with {job.ok} done. "
+                                "The rest are kept; retry later."
+                            )
+                            break
                         self.note("warn", f"Flood wait {wait}s on user {ids[i]}.")
                         await asyncio.sleep(wait + 1)
                         try:
@@ -537,9 +576,25 @@ class HydraEngine:
                         job.fail += 1
                         job.errors.append({"user_id": ids[i], "error": _err_name(exc)})
 
+            if aborted:
+                break
             job.done = min(start + len(chunk), len(requests))
             self.emit("job", job=job.as_dict())
+            if start + BURST < len(requests):
+                await asyncio.sleep(BURST_PACE)
 
+        # Anything never attempted is "skipped", not failed — callers keep them
+        # armed / know they can be retried once Telegram relaxes the limit.
+        skipped = 0
+        for i, (status, _) in enumerate(results):
+            if status == "pending":
+                results[i] = ("skip", None)
+                skipped += 1
+        job.skipped = skipped
+        if aborted:
+            job.detail = f"{aborted} ({skipped} skipped)"
+            self.note("warn", job.detail)
+        self.emit("job", job=job.as_dict())
         return results
 
     def _targets_from_people(
@@ -606,6 +661,8 @@ class HydraEngine:
 
             job.status = "done"
             job.detail = f"Drafts written in {job.ok} DMs (unsent)"
+            if job.skipped:
+                job.detail += f" · {job.skipped} skipped (flood — try again later)"
             self.emit("job", job=job.as_dict())
             self.emit("status", **self.snapshot())
             self.note("ok", job.detail)
@@ -650,13 +707,16 @@ class HydraEngine:
                     )
                 )
 
-            await self._burst(requests, job, "fire drafts", [t.user_id for t in targets])
+            results = await self._burst(requests, job, "fire drafts", [t.user_id for t in targets])
 
-            failed_ids = {e["user_id"] for e in job.errors}
-            self.armed = [t for t in self.armed if t.user_id in failed_ids]
+            # Keep every target that did not go out (failed or flood-skipped)
+            # armed, so "Send all drafts" can resume them later.
+            self.armed = [t for t, (status, _) in zip(targets, results) if status != "ok"]
 
             job.status = "done"
-            job.detail = f"Sent {job.ok}, failed {job.fail}"
+            job.detail = f"Sent {job.ok} · failed {job.fail}"
+            if job.skipped:
+                job.detail += f" · {job.skipped} skipped (flood — still armed)"
             self.emit("job", job=job.as_dict())
             self.emit("status", **self.snapshot())
             self.note("ok", job.detail)
@@ -683,7 +743,14 @@ class HydraEngine:
             ]
             await self._burst(requests, job, "send now", [t.user_id for t in targets])
             job.status = "done"
-            job.detail = f"Sent {job.ok}, failed {job.fail}"
+            job.detail = f"Sent {job.ok} · failed {job.fail}"
+            if job.skipped:
+                job.detail += f" · {job.skipped} skipped (flood) — send to them again later"
+                self.note(
+                    "warn",
+                    f"{job.skipped} DMs skipped: Telegram limits DMs to strangers. "
+                    "Try again in a few hours.",
+                )
             self.emit("job", job=job.as_dict())
             self.note("ok", job.detail)
             return {"job": job.as_dict()}
