@@ -519,6 +519,15 @@ class BotController:
             return self._confirm("clrsent")
         if data == "act:autoint":
             return self._ask("autoint", "act")
+        if data == "act:bcast":
+            if not engine.dmdir:
+                return "No known recipients yet — DM some people first."
+            if not self.ws.message.strip():
+                return "Set the message first (Message screen)."
+            return self._confirm("bcast")
+        if data == "job:cancel":
+            done = engine.cancel_job()
+            return "Cancelling…" if done else "No job running."
         if data == "act:auto":
             if engine.auto.get("on"):
                 await engine.auto_stop()
@@ -664,6 +673,7 @@ class BotController:
             "do:logout": self._run_logout,
             "do:clrsent": self._run_clr_sent,
             "do:auto": self._run_auto_on,
+            "do:bcast": self._run_bcast,
             "do:postinline": self._run_post_inline,
             "do:postsession": self._run_post_session,
             "do:postbot": self._run_post_bot,
@@ -804,6 +814,7 @@ class BotController:
             return "Pick a chat first."
         self.ws.people = await engine.list_requests(int(self.ws.selected_chat["id"]))
         self.ws.selected_ids = {p["id"] for p in self.ws.people}
+        engine.merge_people(self.ws.people)
         self.ws.people_page = 0
         self.ws.screen = "reqs"
         self._ws_persist_people()
@@ -889,6 +900,9 @@ class BotController:
             self.ws.selected_people(),
             self.ws.message.strip(),
         )
+
+    async def _run_bcast(self) -> None:
+        await engine.broadcast(self.ws.message.strip())
 
     async def _run_logout(self) -> None:
         await engine.logout()

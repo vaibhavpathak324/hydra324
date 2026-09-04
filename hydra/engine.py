@@ -116,6 +116,7 @@ class Job:
     skipped: int = 0
     status: str = "running"
     detail: str = ""
+    cancel_requested: bool = False
     errors: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -143,6 +144,9 @@ class HydraEngine:
         self.me: Optional[dict[str, Any]] = None
         # user_ids this account has already DMed — never double-send (persisted).
         self.sent_ids: set[int] = set()
+        # Everyone this account has ever DMed, with access hashes — the
+        # broadcast list (persisted, account-bound).
+        self.dmdir: dict[int, dict[str, Any]] = {}
         # Auto-send job state (persisted): keeps DMing the unsent selection.
         self.auto: dict[str, Any] = {}
         self._auto_task: Optional[asyncio.Task] = None
@@ -199,6 +203,8 @@ class HydraEngine:
             "me": self.me,
             "armed": len(self.armed),
             "sent": len(self.sent_ids),
+            "dir": len(self.dmdir),
+            "draft_msg": (self.armed[0].message[:300] if self.armed else ""),
             "auto": self.auto_status(),
             "job": self.job.as_dict() if self.job else None,
         }
@@ -281,6 +287,14 @@ class HydraEngine:
         except Exception:
             self.sent_ids = set()
         try:
+            d = await store.get("dir") or {}
+            if d.get("uid") and self.me and d["uid"] == self.me.get("id"):
+                self.dmdir = {int(k): v for k, v in (d.get("dir") or {}).items()}
+                if self.dmdir:
+                    self.note("ok", f"Broadcast list loaded — {len(self.dmdir)} known DM recipients.")
+        except Exception:
+            self.dmdir = {}
+        try:
             auto = await store.get("auto") or {}
             self.auto = auto if isinstance(auto, dict) else {}
         except Exception:
@@ -297,6 +311,40 @@ class HydraEngine:
         uid = (self.me or {}).get("id")
         if uid:
             store.push_soon("sent", {"uid": uid, "ids": list(self.sent_ids)})
+
+    def _persist_dir(self) -> None:
+        store.push_soon("dir", {"uid": (self.me or {}).get("id"), "dir": self.dmdir})
+
+    def merge_people(self, people: list[dict[str, Any]]) -> int:
+        """Remember requesters (with access hashes) as potential DM recipients."""
+        n = 0
+        for p in people or []:
+            try:
+                uid = int(p.get("id") or 0)
+                ah = int(p.get("access_hash") or 0)
+            except (TypeError, ValueError):
+                continue
+            if uid and ah:
+                self.dmdir[uid] = {
+                    "id": uid,
+                    "access_hash": str(ah),
+                    "name": p.get("name") or "",
+                    "username": p.get("username"),
+                }
+                n += 1
+        if n:
+            self._persist_dir()
+        return n
+
+    def cancel_job(self) -> bool:
+        j = self.job
+        if j and j.status == "running":
+            j.cancel_requested = True
+            j.detail = "Cancelling…"
+            self.emit("job", job=j.as_dict())
+            self.note("ok", "Cancel requested — stopping after in-flight requests.")
+            return True
+        return False
 
     async def clear_sent(self) -> int:
         n = len(self.sent_ids)
@@ -675,6 +723,9 @@ class HydraEngine:
         aborted: Optional[str] = None
 
         for start in range(0, len(requests), BURST):
+            if job.cancel_requested:
+                aborted = "Cancelled — the rest are kept for retry."
+                break
             chunk = requests[start : start + BURST]
             ids = user_ids[start : start + BURST]
             job.detail = f"{label} · container {start // BURST + 1}/{(len(requests) - 1) // BURST + 1}"
@@ -683,7 +734,7 @@ class HydraEngine:
             # Indices into `chunk` not yet resolved (ok / err / skipped).
             pending = list(range(len(chunk)))
             tries = 0
-            while pending and not aborted:
+            while pending and not aborted and not job.cancel_requested:
                 tries += 1
                 try:
                     raw = await client([chunk[i] for i in pending])
@@ -781,6 +832,8 @@ class HydraEngine:
                             job.errors.append({"user_id": ids[k], "error": _err_name(exc2)})
                     pending = []
 
+            if job.cancel_requested and not aborted:
+                aborted = "Cancelled — the rest are kept for retry."
             if aborted:
                 break
             job.done = min(start + len(chunk), len(requests))
@@ -796,6 +849,8 @@ class HydraEngine:
                 results[i] = ("skip", None)
                 skipped += 1
         job.skipped = skipped
+        if job.cancel_requested:
+            job.status = "cancelled"
         if aborted:
             job.detail = f"{aborted} ({skipped} skipped)"
             self.note("warn", job.detail)
@@ -849,6 +904,7 @@ class HydraEngine:
         """Write the same message as an unsent draft in each requester's DM, in bursts."""
         async with self._job_lock:
             targets, already_sent = self._targets_from_people(people, message, chat_id)
+            self.merge_people(people)
             job = Job(id=f"arm-{int(time.time())}", kind="arm", total=len(targets))
             self.job = job
             self.emit("job", job=job.as_dict())
@@ -871,12 +927,15 @@ class HydraEngine:
             self.armed = [a for a in self.armed if a.user_id not in keep_ids] + armed
             self._persist_armed()
 
-            job.status = "done"
-            job.detail = f"Drafts written in {job.ok} DMs (unsent)"
-            if already_sent:
-                job.detail += f" · {already_sent} already DMed, excluded"
-            if job.skipped:
-                job.detail += f" · {job.skipped} skipped (flood — try again later)"
+            job.status = "done" if job.status != "cancelled" else job.status
+            if job.status == "cancelled":
+                job.detail = f"Cancelled · drafts written {job.ok} · {job.skipped} kept for retry"
+            else:
+                job.detail = f"Drafts written in {job.ok} DMs (unsent)"
+                if already_sent:
+                    job.detail += f" · {already_sent} already DMed, excluded"
+                if job.skipped:
+                    job.detail += f" · {job.skipped} skipped (flood — try again later)"
             self.emit("job", job=job.as_dict())
             self.emit("status", **self.snapshot())
             self.note("ok", job.detail)
@@ -946,15 +1005,29 @@ class HydraEngine:
             # armed, so "Send all drafts" can resume them later.
             self.armed = [t for t, (status, _) in zip(targets, results) if status != "ok"]
             self._persist_armed()
+            self.merge_people(
+                [
+                    {
+                        "id": t.user_id,
+                        "access_hash": str(t.access_hash),
+                        "name": t.name,
+                        "username": t.username,
+                    }
+                    for t in targets
+                ]
+            )
             fired = [t.user_id for t, (status, _) in zip(targets, results) if status == "ok"]
             if fired:
                 self.sent_ids.update(fired)
                 self._persist_sent()
 
-            job.status = "done"
-            job.detail = f"Sent {job.ok} · failed {job.fail}"
-            if job.skipped:
-                job.detail += f" · {job.skipped} skipped (flood — still armed)"
+            job.status = "done" if job.status != "cancelled" else job.status
+            if job.status == "cancelled":
+                job.detail = f"Cancelled · sent {job.ok} · {job.skipped} still armed"
+            else:
+                job.detail = f"Sent {job.ok} · failed {job.fail}"
+                if job.skipped:
+                    job.detail += f" · {job.skipped} skipped (flood — still armed)"
             self.emit("job", job=job.as_dict())
             self.emit("status", **self.snapshot())
             self.note("ok", job.detail)
@@ -965,6 +1038,7 @@ class HydraEngine:
     ) -> dict[str, Any]:
         async with self._job_lock:
             targets, already_sent = self._targets_from_people(people, message, chat_id)
+            self.merge_people(people)
             job = Job(id=f"send-{int(time.time())}", kind="send", total=len(targets))
             self.job = job
             self.emit("job", job=job.as_dict())
@@ -984,20 +1058,80 @@ class HydraEngine:
                 if status == "ok":
                     self.sent_ids.add(t.user_id)
             self._persist_sent()
-            job.status = "done"
-            job.detail = f"Sent {job.ok} · failed {job.fail}"
-            if already_sent:
-                job.detail += f" · {already_sent} already DMed, excluded"
-            if job.skipped:
-                job.detail += f" · {job.skipped} skipped (flood) — send to them again later"
-                self.note(
-                    "warn",
-                    f"{job.skipped} DMs skipped: Telegram limits DMs to strangers. "
-                    "Try again in a few hours.",
-                )
+            job.status = "done" if job.status != "cancelled" else job.status
+            if job.status == "cancelled":
+                job.detail = f"Cancelled · sent {job.ok} · {job.skipped} not sent"
+            else:
+                job.detail = f"Sent {job.ok} · failed {job.fail}"
+                if already_sent:
+                    job.detail += f" · {already_sent} already DMed, excluded"
+                if job.skipped:
+                    job.detail += f" · {job.skipped} skipped (flood) — send to them again later"
+                    self.note(
+                        "warn",
+                        f"{job.skipped} DMs skipped: Telegram limits DMs to strangers. "
+                        "Try again in a few hours.",
+                    )
             self.emit("job", job=job.as_dict())
             self.note("ok", job.detail)
             return {"job": job.as_dict()}
+
+    async def broadcast(self, message: str) -> dict[str, Any]:
+        """Send one message to EVERY known DM recipient (people DMed before).
+
+        Unlike Send DMs now, broadcast deliberately re-DMs people — that is
+        its purpose. Respects the same flood handling and cancel button.
+        """
+        async with self._job_lock:
+            text = message.strip()
+            if not text:
+                raise RuntimeError("Message is empty. Set it on the Message screen.")
+            client = self._need()
+            targets = [
+                ArmedTarget(
+                    user_id=int(uid),
+                    access_hash=int(v.get("access_hash") or 0),
+                    name=v.get("name") or "",
+                    username=v.get("username"),
+                    message=text,
+                    from_chat_id=0,
+                )
+                for uid, v in self.dmdir.items()
+                if int(v.get("access_hash") or 0)
+            ]
+            if not targets:
+                raise RuntimeError(
+                    "No known recipients yet — load requests / DM some people first."
+                )
+            job = Job(id=f"bcast-{int(time.time())}", kind="broadcast", total=len(targets))
+            self.job = job
+            self.emit("job", job=job.as_dict())
+            self.note("ok", f"Broadcasting to {len(targets)} recipients.")
+            requests = [
+                SendMessageRequest(
+                    peer=self._peer(t),
+                    message=t.message,
+                    random_id=random.randrange(1, 2**63),
+                    no_webpage=True,
+                )
+                for t in targets
+            ]
+            results = await self._burst(requests, job, "broadcast", [t.user_id for t in targets])
+            sent_ok = [t.user_id for t, (status, _) in zip(targets, results) if status == "ok"]
+            if sent_ok:
+                self.sent_ids.update(sent_ok)
+                self._persist_sent()
+            job.status = "done" if job.status != "cancelled" else job.status
+            if job.status == "cancelled":
+                job.detail = f"Cancelled · sent {job.ok} · {job.skipped} not sent"
+            else:
+                job.detail = f"Broadcast · sent {job.ok} · failed {job.fail}"
+                if job.skipped:
+                    job.detail += f" · {job.skipped} skipped (flood — broadcast again later)"
+            self.emit("job", job=job.as_dict())
+            self.emit("status", **self.snapshot())
+            self.note(job.status == "cancelled" and "warn" or "ok", job.detail)
+            return {"job": job.as_dict(), "recipients": len(targets)}
 
     async def disarm(self) -> dict[str, Any]:
         async with self._job_lock:

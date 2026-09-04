@@ -77,6 +77,7 @@ def render(engine, ws, bot_username: str = "") -> tuple[str, InlineKeyboardMarku
         "wait": wait,
         "confirm": confirm,
         "job": job,
+        "drafts": drafts,
     }.get(screen, home)
     return fn(engine, ws, bot_username)
 
@@ -243,6 +244,34 @@ def buttons(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     return text, kb(rows)
 
 
+def drafts(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    armed = engine.armed
+    if armed:
+        unique: list[str] = []
+        for t in armed:
+            if t.message not in unique:
+                unique.append(t.message)
+        preview = esc(unique[0][:700])
+        extra = f"\n\n<i>(+ {len(unique) - 1} different message(s) across drafts)</i>" if len(unique) > 1 else ""
+        text = (
+            "<b>Draft status</b>\n\n"
+            f"Drafts written, waiting to send: <b>{len(armed)}</b>\n\n"
+            f"<b>Draft message:</b>\n{preview}{extra}"
+        )
+    else:
+        text = (
+            "<b>Draft status</b>\n\n"
+            "No drafts written.\n\n"
+            "Actions → Write drafts — don't send."
+        )
+    rows = [
+        [B("Refresh", "go:drafts")],
+        [B("Send all drafts", "act:fire"), B("Clear drafts", "act:disarm")],
+        nav(),
+    ]
+    return text, kb(rows)
+
+
 def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     n = len(ws.selected_people())
     auto = engine.auto_status()
@@ -253,14 +282,18 @@ def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         )
     else:
         auto_line = f"off (interval {auto['interval']} min)"
+    draft_msg = esc(ws.message.strip()[:80]) if ws.message.strip() else "<i>unset</i>"
     text = (
         "<b>Actions</b>\n\n"
         f"Selected requesters: <b>{n}</b>\n"
         f"Armed drafts: <b>{len(engine.armed)}</b>\n"
+        f"Broadcast list: <b>{len(engine.dmdir)}</b> known DMs\n"
         f"Auto-send: <b>{auto_line}</b>\n\n"
+        f"Message copy: {draft_msg}\n\n"
         "Write drafts fills each DM compose box and does <b>not</b> send.\n"
         "Send all drafts is the one-click release.\n"
-        "Auto-send keeps DMing the unsent selection automatically until done."
+        "Auto-send keeps DMing the unsent selection automatically until done.\n"
+        "Broadcast re-DMs everyone on the broadcast list."
     )
     rows = [
         [B("Write drafts — don’t send", "act:arm")],
@@ -268,6 +301,8 @@ def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         [B("Send DMs now", "act:send")],
         [B("Send DMs with buttons", "act:inlinedm")],
         [B("Clear drafts", "act:disarm")],
+        [B("📄 Draft status", "go:drafts")],
+        [B("📢 Broadcast", "act:bcast")],
         [B(
             f"Auto-send: {'ON — tap to stop' if auto['on'] else 'OFF — tap to start'}",
             "act:auto",
@@ -380,6 +415,13 @@ def confirm(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
             "Those people become selectable for DMs again.",
             "do:clrsent",
         ),
+        "bcast": (
+            "📢 Broadcast",
+            f"Send the current message to <b>all {len(engine.dmdir)}</b> known DM "
+            "recipients — everyone this account has ever DMed. They get it even "
+            "if they were DMed before.",
+            "do:bcast",
+        ),
         "send": (
             "Send DMs now",
             f"Send the message immediately to <b>{n}</b> requesters.",
@@ -427,16 +469,19 @@ def job(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     if not j:
         return "<b>Job</b>\n\nNo job running.", kb([nav()])
     pct = int(round(100 * j.done / j.total)) if j.total else 0
+    skip_s = f" · skip {j.skipped}" if j.skipped else ""
     text = (
         f"<b>{esc(j.kind)}</b>\n"
         f"<code>{bar(j.done, j.total)}</code>  {pct}%\n\n"
-        f"{j.done}/{j.total} · ok {j.ok} · fail {j.fail}\n"
+        f"{j.done}/{j.total} · ok {j.ok} · fail {j.fail}{skip_s}\n"
         f"{esc(j.detail or j.status)}"
     )
     if j.errors:
         bits = ", ".join(f"{e.get('user_id')}:{e.get('error')}" for e in j.errors[-4:])
         text += f"\n\n<code>{esc(bits)}</code>"
     rows = [[B("Refresh", "go:job")]]
-    if j.status == "done":
+    if j.status == "running":
+        rows.append([B("⏹ Cancel job", "job:cancel")])
+    else:
         rows.append([B("Home", "go:home"), B("Log", "go:log")])
     return text, kb(rows)

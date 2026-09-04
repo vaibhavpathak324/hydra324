@@ -87,6 +87,10 @@ class ScanBody(BaseModel):
     chats: list[dict[str, Any]]
 
 
+class BroadcastBody(BaseModel):
+    message: str = Field(min_length=1)
+
+
 def _fail(exc: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc) or exc.__class__.__name__)
 
@@ -226,6 +230,19 @@ async def clear_sent():
     snap = engine.snapshot()
     snap["cleared"] = n
     return snap
+
+
+@app.post("/api/broadcast")
+async def broadcast(body: BroadcastBody):
+    try:
+        return await engine.broadcast(body.message)
+    except Exception as exc:
+        raise _fail(exc)
+
+
+@app.post("/api/job/cancel")
+async def job_cancel():
+    return {"cancelled": engine.cancel_job()}
 
 
 @app.post("/api/disarm")
