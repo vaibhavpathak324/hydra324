@@ -26,6 +26,7 @@ async def lifespan(app: FastAPI):
     DATA.mkdir(parents=True, exist_ok=True)
     await store.init()
     await engine.try_resume()
+    engine.start_background()
     try:
         await controller.start()
     except Exception as exc:

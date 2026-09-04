@@ -245,12 +245,22 @@ def buttons(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
 
 def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     n = len(ws.selected_people())
+    auto = engine.auto_status()
+    if auto["on"]:
+        auto_line = (
+            f"on · {auto['remaining']} left · next pass in ~{max(1, auto['next_in'] // 60 + 1)} min "
+            f"(every {auto['interval']} min)"
+        )
+    else:
+        auto_line = f"off (interval {auto['interval']} min)"
     text = (
         "<b>Actions</b>\n\n"
         f"Selected requesters: <b>{n}</b>\n"
-        f"Armed drafts: <b>{len(engine.armed)}</b>\n\n"
+        f"Armed drafts: <b>{len(engine.armed)}</b>\n"
+        f"Auto-send: <b>{auto_line}</b>\n\n"
         "Write drafts fills each DM compose box and does <b>not</b> send.\n"
-        "Send all drafts is the one-click release."
+        "Send all drafts is the one-click release.\n"
+        "Auto-send keeps DMing the unsent selection automatically until done."
     )
     rows = [
         [B("Write drafts — don’t send", "act:arm")],
@@ -258,6 +268,11 @@ def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         [B("Send DMs now", "act:send")],
         [B("Send DMs with buttons", "act:inlinedm")],
         [B("Clear drafts", "act:disarm")],
+        [B(
+            f"Auto-send: {'ON — tap to stop' if auto['on'] else 'OFF — tap to start'}",
+            "act:auto",
+        )],
+        [B("Auto interval", "act:autoint")],
         nav(),
     ]
     return text, kb(rows)
@@ -337,6 +352,7 @@ def wait(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "btn_url": ("Add button", "2 / 2 · URL", "Send the URL, including https://"),
         "chat_filter": ("Filter chats", "", "Send text to match titles. Send a single dash (-) to clear."),
         "people_filter": ("Filter people", "", "Send text to match names. Send a single dash (-) to clear."),
+        "autoint": ("Auto-send interval", "", "Send the minutes between automatic passes (10–1440)."),
     }
     title, step, hint = prompts.get(ws.waiting or "", ("HYDRA", "", "Send your next message."))
     step_l = f"\n{esc(step)}\n" if step else "\n"

@@ -53,7 +53,10 @@ CREDS_PATH = DATA / "creds.json"
 SESSION_PATH = DATA / "session.string"
 
 # MTProto containers stay reliable around this size even with medium-length copy.
-BURST = 24
+BURST = 48
+# Pacing between MTProto containers. Drafts are cheap; keep this snappy but
+# not so fast that Telegram flood-waits every container.
+BURST_PACE = 0.35
 # Flood-wait policy: short waits are slept off and the job resumes on its own.
 # A single wait longer than FLOOD_SLEEP_CAP (or too much total waiting) pauses
 # the job instead of freezing it for hours; unattempted targets are reported
@@ -140,6 +143,9 @@ class HydraEngine:
         self.me: Optional[dict[str, Any]] = None
         # user_ids this account has already DMed — never double-send (persisted).
         self.sent_ids: set[int] = set()
+        # Auto-send job state (persisted): keeps DMing the unsent selection.
+        self.auto: dict[str, Any] = {}
+        self._auto_task: Optional[asyncio.Task] = None
         self.phase: str = "logged_out"
         self.armed: list[ArmedTarget] = []
         self.job: Optional[Job] = None
@@ -193,6 +199,7 @@ class HydraEngine:
             "me": self.me,
             "armed": len(self.armed),
             "sent": len(self.sent_ids),
+            "auto": self.auto_status(),
             "job": self.job.as_dict() if self.job else None,
         }
 
@@ -273,6 +280,14 @@ class HydraEngine:
                     self.note("ok", f"DM history loaded — {len(self.sent_ids)} already DMed, they'll be skipped.")
         except Exception:
             self.sent_ids = set()
+        try:
+            auto = await store.get("auto") or {}
+            self.auto = auto if isinstance(auto, dict) else {}
+        except Exception:
+            self.auto = {}
+        if self.auto.get("on"):
+            self._ensure_auto_loop()
+            self.note("ok", f"Auto-send restored — {len(self._auto_remaining())} still to DM.")
 
     def _persist_armed(self) -> None:
         store.push_soon("armed_uid", (self.me or {}).get("id"))
@@ -289,6 +304,98 @@ class HydraEngine:
         store.push_soon("sent", None)
         self.note("ok", f"Cleared DM history ({n} records). Those people can be DMed again.")
         return n
+
+    # ── auto-send ───────────────────────────────────────────
+    def auto_status(self) -> dict[str, Any]:
+        a = self.auto or {}
+        on = bool(a.get("on"))
+        return {
+            "on": on,
+            "interval": int(a.get("interval", 30) or 30),
+            "remaining": len(self._auto_remaining()) if on else 0,
+            "next_in": max(0, int((a.get("next") or 0) - time.time())) if on else 0,
+        }
+
+    def _auto_remaining(self) -> list[dict[str, Any]]:
+        return [
+            p
+            for p in (self.auto or {}).get("people", [])
+            if int(p.get("id") or 0) not in self.sent_ids
+            and int(p.get("access_hash") or 0)
+        ]
+
+    def _ensure_auto_loop(self) -> None:
+        if self._auto_task is None or self._auto_task.done():
+            self._auto_task = asyncio.create_task(self._auto_loop(), name="hydra-auto-send")
+
+    def start_background(self) -> None:
+        if (self.auto or {}).get("on"):
+            self._ensure_auto_loop()
+
+    async def auto_start(
+        self, chat_id: int, people: list[dict[str, Any]], message: str, interval: Optional[int] = None
+    ) -> None:
+        interval = int(interval or (self.auto or {}).get("interval") or 30)
+        self.auto = {
+            "on": True,
+            "chat_id": int(chat_id),
+            "people": list(people),
+            "message": message,
+            "interval": interval,
+            "next": time.time() + 20,
+        }
+        store.push_soon("auto", self.auto)
+        self._ensure_auto_loop()
+        self.note(
+            "ok",
+            f"Auto-send ON — {len(self._auto_remaining())} to DM, one pass every {interval} min.",
+        )
+        self.emit("status", **self.snapshot())
+
+    async def auto_stop(self) -> None:
+        self.auto = {"on": False, "interval": (self.auto or {}).get("interval", 30)}
+        store.push_soon("auto", self.auto)
+        self.note("ok", "Auto-send stopped.")
+        self.emit("status", **self.snapshot())
+
+    def auto_set_interval(self, minutes: int) -> None:
+        a = dict(self.auto or {})
+        a["interval"] = max(10, min(1440, int(minutes)))
+        a.setdefault("on", False)
+        self.auto = a
+        store.push_soon("auto", a)
+
+    async def _auto_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await self._auto_tick()
+            except Exception as exc:
+                self.note("warn", f"Auto-send check failed: {_err_name(exc)}")
+
+    async def _auto_tick(self) -> None:
+        a = self.auto or {}
+        if not a.get("on") or self.phase != "ready":
+            return
+        if self.job and self.job.status == "running":
+            return
+        if time.time() < (a.get("next") or 0):
+            return
+        remaining = self._auto_remaining()
+        if not remaining:
+            self.auto = {"on": False, "interval": a.get("interval", 30)}
+            store.push_soon("auto", self.auto)
+            self.note("ok", "Auto-send finished — everyone in the selection has been DMed. ✅")
+            self.emit("status", **self.snapshot())
+            return
+        self.note("ok", f"Auto-send pass: {len(remaining)} still unsent, sending now.")
+        try:
+            await self.send_now(int(a["chat_id"]), remaining, a["message"])
+        except Exception as exc:
+            self.note("warn", f"Auto-send pass: {_err_name(exc)}")
+        a["next"] = time.time() + int(a.get("interval", 30) or 30) * 60
+        store.push_soon("auto", a)
+        self.emit("status", **self.snapshot())
 
     # ── auth ────────────────────────────────────────────────
     async def start_login(self, api_id: int, api_hash: str, phone: str) -> dict[str, Any]:
@@ -545,7 +652,9 @@ class HydraEngine:
             # NOTE: do NOT stop on short pages (<100) — Telegram routinely
             # returns a few less than requested; only an empty/non-advancing
             # page means we are done. Stopping early truncated lists at ~199.
-            await asyncio.sleep(0.2)
+            if pages % 25 == 0:
+                self.note("ok", f"Loading requests… {len(people)} so far")
+            await asyncio.sleep(0.05)
 
         self.note("ok", f"Loaded {len(people)} pending join requests (not approved, not declined).")
         return people

@@ -87,6 +87,7 @@ async def set(key: str, value: Any) -> None:
             if value is None:
                 await conn.execute("DELETE FROM hydra_state WHERE key = $1", key)
             else:
+                payload = await asyncio.to_thread(json.dumps, value)
                 await conn.execute(
                     """
                     INSERT INTO hydra_state (key, value, updated_at)
@@ -95,7 +96,7 @@ async def set(key: str, value: Any) -> None:
                     DO UPDATE SET value = EXCLUDED.value, updated_at = now()
                     """,
                     key,
-                    json.dumps(value),
+                    payload,
                 )
     except Exception as exc:  # noqa: BLE001
         log.warning("store.set(%s) failed: %s", key, exc)

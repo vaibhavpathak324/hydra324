@@ -124,6 +124,46 @@ class BotController:
         self._queue = None
         self.inline_store: dict[str, dict[str, Any]] = {}
 
+    # ── workspace persistence (survives restarts) ───────────
+    def _ws_persist_core(self) -> None:
+        store.push_soon(
+            "ws",
+            {
+                "message": self.ws.message,
+                "buttons": self.ws.buttons,
+                "chats": self.ws.chats,
+                "selected_chat": self.ws.selected_chat,
+                "chat_filter": self.ws.chat_filter,
+                "people_filter": self.ws.people_filter,
+            },
+        )
+
+    def _ws_persist_people(self) -> None:
+        store.push_soon("ws_people", self.ws.people)
+
+    def _ws_persist_sel(self) -> None:
+        store.push_soon("ws_sel", sorted(self.ws.selected_ids))
+
+    async def _ws_restore(self) -> None:
+        try:
+            core = await store.get("ws") or {}
+            if core.get("message"):
+                self.ws.message = core["message"]
+            if core.get("buttons"):
+                self.ws.buttons = core["buttons"]
+            self.ws.chats = core.get("chats") or []
+            self.ws.selected_chat = core.get("selected_chat")
+            self.ws.chat_filter = core.get("chat_filter") or ""
+            self.ws.people_filter = core.get("people_filter") or ""
+            self.ws.people = await store.get("ws_people") or []
+            ids = await store.get("ws_sel") or []
+            valid = {p.get("id") for p in self.ws.people}
+            self.ws.selected_ids = {i for i in ids if i in valid}
+            if self.ws.message or self.ws.people:
+                engine.note("ok", "Workspace restored — message, chats, requests, selection.")
+        except Exception:
+            pass
+
     # ── persistence ─────────────────────────────────────────
     def _load(self) -> dict[str, Any]:
         if BOT_PATH.exists():
@@ -189,6 +229,8 @@ class BotController:
                 stored["owner_id"] = int(env_owner)
         self.token = token
         self.owner_id = stored.get("owner_id")
+        if not self.ws.message and not self.ws.people:
+            await self._ws_restore()
         self.application = (
             Application.builder()
             .token(token)
@@ -475,6 +517,19 @@ class BotController:
             return self._confirm("logout")
         if data == "act:clrsent":
             return self._confirm("clrsent")
+        if data == "act:autoint":
+            return self._ask("autoint", "act")
+        if data == "act:auto":
+            if engine.auto.get("on"):
+                await engine.auto_stop()
+                return "Auto-send stopped."
+            if not self.ws.selected_chat:
+                return "Pick a chat first."
+            if not self.ws.selected_people():
+                return "Select requesters first (Requests screen)."
+            if not self.ws.message.strip():
+                return "Set the message first (Message screen)."
+            return self._confirm("auto")
 
         if data == "chats:load":
             return await self._load_chats()
@@ -491,11 +546,24 @@ class BotController:
             rows = self.ws.visible_chats()
             if idx < 0 or idx >= len(rows):
                 return "Reload chats."
-            self.ws.selected_chat = rows[idx]
+            chat = rows[idx]
+            same = (
+                self.ws.selected_chat
+                and self.ws.people
+                and self.ws.selected_chat.get("id") == chat.get("id")
+            )
+            self.ws.selected_chat = chat
+            if same:
+                # Cached list for this chat — show instantly, Reload refreshes.
+                self.ws.people_page = 0
+                self.ws.screen = "reqs"
+                self._ws_persist_core()
+                return f"{len(self.ws.people)} requests (saved — Reload for fresh)"
             self.ws.people = []
             self.ws.selected_ids = set()
             self.ws.people_page = 0
             self.ws.screen = "reqs"
+            self._ws_persist_core()
             return await self._load_requests()
 
         if data == "reqs:load":
@@ -503,15 +571,18 @@ class BotController:
         if data == "reqs:all":
             self.ws.selected_ids = {p["id"] for p in self.ws.people}
             self.ws.screen = "reqs"
+            self._ws_persist_sel()
             return f"{len(self.ws.selected_ids)} selected"
         if data == "reqs:none":
             self.ws.selected_ids = set()
             self.ws.screen = "reqs"
+            self._ws_persist_sel()
             return "Cleared"
         if data == "reqs:unsent":
             self.ws.selected_ids = {p["id"] for p in self.ws.people if not p.get("dm_sent")}
             self.ws.people_page = 0
             self.ws.screen = "reqs"
+            self._ws_persist_sel()
             return f"{len(self.ws.selected_ids)} unsent selected"
         if data == "reqs:filter":
             return self._ask("people_filter", "reqs")
@@ -530,6 +601,7 @@ class BotController:
             else:
                 self.ws.selected_ids.add(uid)
             self.ws.screen = "reqs"
+            self._ws_persist_sel()
             return None
 
         if data == "msg:set":
@@ -537,6 +609,7 @@ class BotController:
         if data == "msg:clear":
             self.ws.message = ""
             self.ws.screen = "msg"
+            self._ws_persist_core()
             return "Cleared"
 
         if data == "btn:add":
@@ -545,6 +618,7 @@ class BotController:
             if self.ws.buttons and self.ws.buttons[-1]:
                 self.ws.buttons.append([])
             self.ws.screen = "btns"
+            self._ws_persist_core()
             return "New row"
         if data == "btn:del":
             if not self.ws.buttons:
@@ -555,10 +629,12 @@ class BotController:
             if not last:
                 self.ws.buttons.pop()
             self.ws.screen = "btns"
+            self._ws_persist_core()
             return "Removed"
         if data == "btn:clr":
             self.ws.buttons = []
             self.ws.screen = "btns"
+            self._ws_persist_core()
             return "Cleared"
 
         if data == "post:preview":
@@ -587,6 +663,7 @@ class BotController:
             "do:disarm": self._run_disarm,
             "do:logout": self._run_logout,
             "do:clrsent": self._run_clr_sent,
+            "do:auto": self._run_auto_on,
             "do:postinline": self._run_post_inline,
             "do:postsession": self._run_post_session,
             "do:postbot": self._run_post_bot,
@@ -678,25 +755,38 @@ class BotController:
             self.ws.buttons[-1].append({"text": self.ws.tmp_label or "Open", "url": url})
             self.ws.waiting = None
             self.ws.screen = "btns"
+            self._ws_persist_core()
             return "Button added"
         if w == "chat_filter":
             self.ws.chat_filter = "" if text.strip() == "-" else text.strip()
             self.ws.chat_page = 0
             self.ws.waiting = None
             self.ws.screen = "chats"
+            self._ws_persist_core()
             return "Filtered"
         if w == "people_filter":
             self.ws.people_filter = "" if text.strip() == "-" else text.strip()
             self.ws.people_page = 0
             self.ws.waiting = None
             self.ws.screen = "reqs"
+            self._ws_persist_core()
             return "Filtered"
+        if w == "autoint":
+            try:
+                n = max(10, min(1440, int(text.strip())))
+            except ValueError:
+                return self._ask("autoint", "act")
+            engine.auto_set_interval(n)
+            self.ws.waiting = None
+            self.ws.screen = "act"
+            return f"Auto-send interval: every {n} min"
         return None
 
     async def _load_chats(self) -> str:
         self.ws.chats = await engine.list_chats()
         self.ws.chat_page = 0
         self.ws.screen = "chats"
+        self._ws_persist_core()
         return f"{len(self.ws.chats)} chats"
 
     async def _scan_chats(self) -> str:
@@ -704,6 +794,7 @@ class BotController:
             await self._load_chats()
         self.ws.chats = await engine.scan_pending(self.ws.chats)
         self.ws.screen = "chats"
+        self._ws_persist_core()
         pending = sum(c.get("pending") or 0 for c in self.ws.chats)
         return f"{pending} pending across admin chats"
 
@@ -715,6 +806,8 @@ class BotController:
         self.ws.selected_ids = {p["id"] for p in self.ws.people}
         self.ws.people_page = 0
         self.ws.screen = "reqs"
+        self._ws_persist_people()
+        self._ws_persist_sel()
         return f"{len(self.ws.people)} requests"
 
     async def _preview(self) -> None:
@@ -789,11 +882,23 @@ class BotController:
     async def _run_clr_sent(self) -> None:
         await engine.clear_sent()
 
+    async def _run_auto_on(self) -> None:
+        chat = self.ws.selected_chat or {}
+        await engine.auto_start(
+            int(chat["id"]),
+            self.ws.selected_people(),
+            self.ws.message.strip(),
+        )
+
     async def _run_logout(self) -> None:
         await engine.logout()
         self.ws.chats = []
         self.ws.people = []
         self.ws.selected_chat = None
+        self.ws.selected_ids = set()
+        store.push_soon("ws", None)
+        store.push_soon("ws_people", None)
+        store.push_soon("ws_sel", None)
         self.ws.screen = "session"
 
     async def _run_post_inline(self) -> None:
