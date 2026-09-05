@@ -9,7 +9,9 @@ venv/
 data/*.session
 data/*.session-journal
 data/session.string
+data/session-*.string
 data/creds.json
+data/creds-*.json
 data/bot.json
 data/*.log
 *.session
