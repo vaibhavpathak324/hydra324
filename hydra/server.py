@@ -105,9 +105,12 @@ async def index():
 
 @app.get("/api/status")
 async def status():
+    from hydra.engine import FLOOD
+
     snap = engine.snapshot()
     snap["bot"] = controller.status()
     snap["sessions"] = pool.summary()
+    snap["flood_cap"] = FLOOD["cap"]
     snap["defaults"] = {
         "api_id": (os.environ.get("TELEGRAM_API_ID") or os.environ.get("API_ID") or "").strip(),
         "api_hash": (os.environ.get("TELEGRAM_API_HASH") or os.environ.get("API_HASH") or "").strip(),

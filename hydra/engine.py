@@ -60,14 +60,20 @@ BURST_PACE = 0.35
 # Draft writing is much cheaper for Telegram than sending — run it wider.
 ARM_BURST = 64
 ARM_PACE = 0.15
-# Flood-wait policy: short waits are slept off and the job resumes on its own.
-# A single wait longer than FLOOD_SLEEP_CAP (or too much total waiting) pauses
-# the job instead of freezing it for hours; unattempted targets are reported
-# as "skipped" and (for fired drafts) stay armed so they can be retried later.
-FLOOD_SLEEP_CAP = 600
-FLOOD_TOTAL_SLEEP_CAP = 1200
-FLOOD_MAX_TRIES = 3
-BURST_PACE = 1.5
+# Flood-wait override (user setting, min 3s): when Telegram demands a wait,
+# sleep only this long, retry FLOOD_RETRIES times, then mark the item as
+# flood_wait and MOVE ON — no long pauses, no aborted jobs. Telegram may
+# re-demand the wait on early retries; those items simply fail fast and stay
+# retryable (drafts remain armed, sent-history is only recorded on success).
+FLOOD = {"cap": 3.0}
+FLOOD_RETRIES = 2
+
+
+def set_flood_cap(seconds: float) -> float:
+    cap = max(3.0, min(60.0, float(seconds)))
+    FLOOD["cap"] = cap
+    store.push_soon("flood_cap", cap)
+    return cap
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -662,7 +668,7 @@ class HydraEngine:
                     )
                 )
             except FloodWaitError as exc:
-                wait = min(int(getattr(exc, "seconds", 1) or 1), 60)
+                wait = int(getattr(exc, "seconds", 1) or 1)
                 if flood_budget <= 0:
                     self.note(
                         "warn",
@@ -670,9 +676,12 @@ class HydraEngine:
                         "Open Requests again later to load the rest.",
                     )
                     break
-                flood_budget -= wait
-                self.note("warn", f"Flood wait {wait}s while listing requests — continuing.")
-                await asyncio.sleep(wait + 1)
+                flood_budget -= FLOOD["cap"]
+                self.note(
+                    "warn",
+                    f"Flood wait {wait}s while listing — continuing after {FLOOD['cap']:.0f}s.",
+                )
+                await asyncio.sleep(FLOOD["cap"] + 0.5)
                 continue
             users = {u.id: u for u in result.users if isinstance(u, User)}
             if not result.importers:
@@ -742,7 +751,6 @@ class HydraEngine:
         chunk_size = int(burst or BURST)
         pace_s = float(pace if pace is not None else BURST_PACE)
 
-        flood_sleep_total = 0
         aborted: Optional[str] = None
 
         for start in range(0, len(requests), chunk_size):
@@ -778,7 +786,7 @@ class HydraEngine:
                             results[start + k] = ("ok", exc.results[i])
                             job.ok += 1
                         elif isinstance(err, FloodWaitError):
-                            # Per-item flood: retry just these after a pause.
+                            # Per-item flood: retry just these after the cap.
                             retry.append(k)
                             max_wait = max(max_wait, int(getattr(err, "seconds", 1) or 1))
                         else:
@@ -788,43 +796,40 @@ class HydraEngine:
                     if not retry:
                         pending = []
                         break
-                    if (
-                        tries >= FLOOD_MAX_TRIES
-                        or max_wait > FLOOD_SLEEP_CAP
-                        or flood_sleep_total + max_wait > FLOOD_TOTAL_SLEEP_CAP
-                    ):
-                        aborted = (
-                            f"Telegram demands a break ({max_wait}s+) — paused with {job.ok} done. "
-                            "The rest are kept; retry in a few hours."
-                        )
+                    if tries > FLOOD_RETRIES:
+                        for k in retry:
+                            results[start + k] = ("err", None)
+                            job.fail += 1
+                            job.errors.append(
+                                {"user_id": ids[k], "error": f"flood_wait:{max_wait}"}
+                            )
+                        pending = []
                         break
-                    flood_sleep_total += max_wait
                     job.detail = (
-                        f"Flood wait {max_wait}s on {len(retry)} items — auto-resuming, "
-                        f"{job.ok}/{len(requests)} done"
+                        f"Flood wait {max_wait}s on {len(retry)} items — "
+                        f"retrying in {FLOOD['cap']:.0f}s ({job.ok}/{len(requests)} done)"
                     )
                     self.emit("job", job=job.as_dict())
-                    self.note("warn", f"Flood wait {max_wait}s during {label}; resuming automatically.")
-                    await asyncio.sleep(max_wait + 1)
+                    await asyncio.sleep(FLOOD["cap"] + 0.5)
                     pending = retry
                 except FloodWaitError as exc:
                     # Whole container rejected: nothing executed, safe to retry all.
                     wait = int(getattr(exc, "seconds", 1) or 1)
-                    if (
-                        tries >= FLOOD_MAX_TRIES
-                        or wait > FLOOD_SLEEP_CAP
-                        or flood_sleep_total + wait > FLOOD_TOTAL_SLEEP_CAP
-                    ):
-                        aborted = (
-                            f"Telegram demands a break ({wait}s) — paused with {job.ok} done. "
-                            "The rest are kept; retry in a few hours."
-                        )
+                    if tries > FLOOD_RETRIES:
+                        for k in pending:
+                            results[start + k] = ("err", exc)
+                            job.fail += 1
+                            job.errors.append(
+                                {"user_id": ids[k], "error": f"flood_wait:{wait}"}
+                            )
+                        pending = []
                         break
-                    flood_sleep_total += wait
-                    job.detail = f"Telegram flood wait {wait}s — auto-resuming, {job.ok}/{len(requests)} done"
+                    job.detail = (
+                        f"Telegram flood wait {wait}s — retrying in {FLOOD['cap']:.0f}s "
+                        f"({job.ok}/{len(requests)} done)"
+                    )
                     self.emit("job", job=job.as_dict())
-                    self.note("warn", f"Flood wait {wait}s during {label}; resuming automatically.")
-                    await asyncio.sleep(wait + 1)
+                    await asyncio.sleep(FLOOD["cap"] + 0.5)
                 except Exception as exc:
                     self.note("warn", f"Container failed ({_err_name(exc)}); retrying peers one by one.")
                     for k in pending:
@@ -833,14 +838,7 @@ class HydraEngine:
                             results[start + k] = ("ok", item)
                             job.ok += 1
                         except FloodWaitError as fw:
-                            wait = int(getattr(fw, "seconds", 1) or 1)
-                            if wait > FLOOD_SLEEP_CAP:
-                                aborted = (
-                                    f"Telegram demands a break ({wait}s) — paused with {job.ok} done. "
-                                    "The rest are kept; retry in a few hours."
-                                )
-                                break
-                            await asyncio.sleep(wait + 1)
+                            await asyncio.sleep(FLOOD["cap"] + 0.5)
                             try:
                                 item = await client(chunk[k])
                                 results[start + k] = ("ok", item)
@@ -1393,6 +1391,7 @@ class EnginePool:
 
     async def bootstrap(self) -> None:
         """Restore every stored session at boot (legacy data becomes 'main')."""
+        FLOOD["cap"] = float(await store.get("flood_cap") or 3)
         meta = await store.get("pool") or {}
         keys = list(meta.get("keys") or [])
         main = HydraEngine("main")

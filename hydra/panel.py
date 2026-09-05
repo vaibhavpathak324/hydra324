@@ -384,11 +384,16 @@ def logs(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
 
 
 def settings(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    from hydra.engine import FLOOD, pool
+
     bot = f"@{esc(bot_username)}" if bot_username else "—"
+    n_sessions = len(pool.summary())
     text = (
         "<b>Settings</b>\n\n"
         f"Control bot    {bot}\n"
-        f"Session        {session_line(engine)}\n\n"
+        f"Session        {session_line(engine)}\n"
+        f"Sessions       {n_sessions}\n"
+        f"Flood waits    sleep ≤ <b>{FLOOD['cap']:.0f}s</b>, retry twice, move on\n\n"
         "This bot only answers the first Telegram account that opens it "
         "(the owner). Everyone else is ignored.\n\n"
         "Inline mode: @BotFather → your bot → Bot Settings → Inline Mode → On.\n"
@@ -398,6 +403,7 @@ def settings(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         [B("Refresh panel", "go:home")],
         [B("Export session", "sess:export")],
         [B(f"Clear DM history ({len(engine.sent_ids)})", "act:clrsent")],
+        [B(f"Flood wait cap · {FLOOD['cap']:.0f}s", "set:flood")],
         nav(),
     ]
     return text, kb(rows)
@@ -419,6 +425,7 @@ def wait(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "chat_filter": ("Filter chats", "", "Send text to match titles. Send a single dash (-) to clear."),
         "people_filter": ("Filter people", "", "Send text to match names. Send a single dash (-) to clear."),
         "autoint": ("Auto-send interval", "", "Send the minutes between automatic passes (10–1440)."),
+        "floodset": ("Flood wait cap", "", "Send the maximum seconds to sleep on a Telegram flood wait (3–60). After two retries the item is marked failed and the job moves on — no long pauses."),
     }
     title, step, hint = prompts.get(ws.waiting or "", ("HYDRA", "", "Send your next message."))
     step_l = f"\n{esc(step)}\n" if step else "\n"

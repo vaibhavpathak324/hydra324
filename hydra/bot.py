@@ -440,6 +440,15 @@ class BotController:
             await self.paint()
         except Exception:
             log.exception("paint")
+            # Surface render errors to the owner instead of a frozen panel.
+            try:
+                if self.ws.panel_chat_id:
+                    await self.application.bot.send_message(
+                        self.ws.panel_chat_id,
+                        "Panel error — tap Open panel to rebuild it.",
+                    )
+            except Exception:
+                pass
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -516,8 +525,18 @@ class BotController:
             return None
         if data == "wait:cancel":
             self.ws.waiting = None
+            if self._login_eng is not None:
+                try:
+                    if self._login_eng.client:
+                        await self._login_eng.client.disconnect()
+                except Exception:
+                    pass
+                self._login_eng = None
             self.ws.screen = self.ws.return_screen or "home"
             return "Cancelled"
+
+        if data == "set:flood":
+            return self._ask("floodset", "set")
 
         if data.startswith("go:"):
             dest = data.split(":", 1)[1]
@@ -848,6 +867,17 @@ class BotController:
             self.ws.waiting = None
             self.ws.screen = "act"
             return f"Auto-send interval: every {n} min"
+        if w == "floodset":
+            from hydra.engine import set_flood_cap
+
+            try:
+                n = int(float(text.strip()))
+            except ValueError:
+                return self._ask("floodset", "set")
+            cap = set_flood_cap(n)
+            self.ws.waiting = None
+            self.ws.screen = "set"
+            return f"Flood waits now sleep at most {cap:.0f}s, then retry twice and move on."
         return None
 
     async def _load_chats(self) -> str:
