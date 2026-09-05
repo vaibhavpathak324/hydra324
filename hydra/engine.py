@@ -256,36 +256,59 @@ class HydraEngine:
             return None
         return self.client.session.save()
 
-    async def try_resume(self) -> None:
-        if not self.creds_path.exists() or not self.session_path.exists():
+    async def try_resume(self) -> bool:
+        """Restore the saved session. Returns True when the session is live.
+
+        Retries twice on transient failures (network/DC hiccups at boot) —
+        giving up on the first blip left the bot 'logged out' until a
+        redeploy, which is exactly what we want to avoid.
+        """
+        for attempt in range(1, 4):
             # Ephemeral filesystem (e.g. Render free tier): restore from the
             # Supabase state store before giving up.
-            await store.pull_to_file(self._k("creds"), self.creds_path)
-            await store.pull_to_file(self._k("session"), self.session_path)
-        if not self.creds_path.exists() or not self.session_path.exists():
-            return
-        try:
-            creds = json.loads(self.creds_path.read_text())
-            session = self.session_path.read_text().strip()
-            if not session or not creds.get("api_id"):
-                return
-            self.api_id = int(creds["api_id"])
-            self.api_hash = creds["api_hash"]
-            self.phone = creds.get("phone")
-            self.client = self._make_client(StringSession(session))
-            await self.client.connect()
-            if await self.client.is_user_authorized():
-                await self._mark_online()
-                self.note("ok", "Resumed existing session.")
-                await self._restore_state()
-            else:
+            if not self.creds_path.exists() or not self.session_path.exists():
+                if not await store.ensure_ready():
+                    return False  # store unreachable — self-heal will retry
+                await store.pull_to_file(self._k("creds"), self.creds_path)
+                await store.pull_to_file(self._k("session"), self.session_path)
+            if not self.creds_path.exists() or not self.session_path.exists():
+                return False  # nothing stored for this slot yet
+            try:
+                creds = json.loads(self.creds_path.read_text())
+                session = self.session_path.read_text().strip()
+                if not session or not creds.get("api_id"):
+                    return False
+                self.api_id = int(creds["api_id"])
+                self.api_hash = creds["api_hash"]
+                self.phone = creds.get("phone")
+                self.client = self._make_client(StringSession(session))
+                await self.client.connect()
+                if await self.client.is_user_authorized():
+                    await self._mark_online()
+                    self.note("ok", "Resumed existing session.")
+                    await self._restore_state()
+                    return True
+                # Genuinely unauthorized (revoked/logged out elsewhere)
                 await self.client.disconnect()
                 self.client = None
                 self.phase = "logged_out"
-        except Exception as exc:
-            self.note("warn", f"Could not resume session: {_err_name(exc)}")
-            self.client = None
-            self.phase = "logged_out"
+                self.note("warn", "Session is no longer authorized — log in again.")
+                return False
+            except Exception as exc:
+                self.note(
+                    "warn",
+                    f"Could not resume session (attempt {attempt}/3): {_err_name(exc)}"
+                    + (" — retrying…" if attempt < 3 else " — will keep retrying in the background."),
+                )
+                if self.client:
+                    try:
+                        await self.client.disconnect()
+                    except Exception:
+                        pass
+                self.client = None
+                self.phase = "logged_out"
+                await asyncio.sleep(3 * attempt)
+        return False
 
     async def _restore_state(self) -> None:
         """Rebuild armed drafts + DM history from the state store (survives restarts)."""
@@ -1388,6 +1411,39 @@ class EnginePool:
         except Exception:
             pass
         self.forget(key)
+
+    async def _has_stored_sessions(self) -> bool:
+        if not await store.ensure_ready():
+            return False
+        if await store.get("session"):
+            return True
+        meta = await store.get("pool") or {}
+        for k in meta.get("keys") or []:
+            if k != "main" and await store.get(f"{k}:session"):
+                return True
+        return False
+
+    async def self_heal(self) -> None:
+        """Watchdog: if no session restored at boot (transient Supabase /
+        Telegram failure), keep retrying every 45s until it reconnects —
+        instead of staying 'logged out' until the next deploy."""
+        while True:
+            await asyncio.sleep(45)
+            try:
+                if self.engines:
+                    continue
+                if not await self._has_stored_sessions():
+                    continue  # user genuinely has no session yet
+                await self.bootstrap()
+                if self.engines:
+                    for e in self.engines.values():
+                        e.start_background()
+                    self.active().note(
+                        "ok",
+                        "Session reconnected automatically after a failed startup restore.",
+                    )
+            except Exception:
+                pass
 
     async def bootstrap(self) -> None:
         """Restore every stored session at boot (legacy data becomes 'main')."""

@@ -27,6 +27,7 @@ async def lifespan(app: FastAPI):
     await store.init()
     await pool.bootstrap()
     engine.start_background()
+    pool._heal_task = asyncio.create_task(pool.self_heal(), name="hydra-self-heal")
     try:
         await controller.start()
     except Exception as exc:
@@ -37,6 +38,8 @@ async def lifespan(app: FastAPI):
         await controller.stop()
     except Exception:
         pass
+    if getattr(pool, "_heal_task", None):
+        pool._heal_task.cancel()
     for eng in pool.engines.values():
         if eng.client:
             try:

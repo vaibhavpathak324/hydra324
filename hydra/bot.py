@@ -881,6 +881,9 @@ class BotController:
         return None
 
     async def _load_chats(self) -> str:
+        if engine.phase != "ready":
+            self.ws.screen = "session"
+            return "No active session — add or select one in Sessions first."
         self.ws.chats = await engine.list_chats()
         self.ws.chat_page = 0
         self.ws.screen = "chats"
@@ -900,6 +903,9 @@ class BotController:
         if not self.ws.selected_chat:
             self.ws.screen = "chats"
             return "Pick a chat first."
+        if engine.phase != "ready":
+            self.ws.screen = "session"
+            return "No active session — add or select one in Sessions first."
         self.ws.people = await engine.list_requests(int(self.ws.selected_chat["id"]))
         self.ws.selected_ids = {p["id"] for p in self.ws.people}
         engine.merge_people(self.ws.people)

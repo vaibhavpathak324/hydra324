@@ -34,36 +34,54 @@ def enabled() -> bool:
 
 
 async def init() -> None:
-    """Create the pool and ensure the state table exists. Safe to call twice."""
+    """Create the pool and ensure the state table exists. Safe to call twice.
+
+    Retries on transient failures — a one-off network hiccup at boot must not
+    disable persistence (and thus session restore) for the process lifetime.
+    """
     global _pool, _ready
     if not DSN or _ready:
         return
-    try:
-        import asyncpg
+    import asyncpg
 
-        _pool = await asyncpg.create_pool(
-            DSN,
-            ssl="require",
-            min_size=1,
-            max_size=3,
-            command_timeout=20,
-        )
-        async with _pool.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS hydra_state (
-                    key        text PRIMARY KEY,
-                    value      jsonb NOT NULL,
-                    updated_at timestamptz NOT NULL DEFAULT now()
-                )
-                """
+    for attempt in range(1, 4):
+        try:
+            _pool = await asyncpg.create_pool(
+                DSN,
+                ssl="require",
+                min_size=1,
+                max_size=3,
+                command_timeout=20,
             )
-        _ready = True
-        log.info("State store ready (Supabase).")
-    except Exception as exc:  # noqa: BLE001 - store must never crash the app
-        log.warning("State store disabled: %s", exc)
-        _pool = None
-        _ready = False
+            async with _pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS hydra_state (
+                        key        text PRIMARY KEY,
+                        value      jsonb NOT NULL,
+                        updated_at timestamptz NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+            _ready = True
+            log.info("State store ready (Supabase).")
+            return
+        except Exception as exc:  # noqa: BLE001 - store must never crash the app
+            _pool = None
+            _ready = False
+            if attempt < 3:
+                log.warning("State store init failed (attempt %s/3): %s — retrying", attempt, exc)
+                await asyncio.sleep(2 * attempt)
+            else:
+                log.warning("State store disabled after 3 attempts: %s", exc)
+
+
+async def ensure_ready() -> bool:
+    """Retry init if it previously failed. True when the store is usable."""
+    if _ready:
+        return True
+    await init()
+    return _ready
 
 
 async def get(key: str) -> Optional[Any]:
