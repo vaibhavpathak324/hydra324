@@ -26,7 +26,8 @@ async def lifespan(app: FastAPI):
     DATA.mkdir(parents=True, exist_ok=True)
     await store.init()
     await pool.bootstrap()
-    engine.start_background()
+    for eng in list(pool.engines.values()):
+        eng.start_background()
     pool._heal_task = asyncio.create_task(pool.self_heal(), name="hydra-self-heal")
     try:
         await controller.start()

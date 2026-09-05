@@ -53,13 +53,13 @@ DATA = ROOT / "data"
 CREDS_PATH = DATA / "creds.json"
 SESSION_PATH = DATA / "session.string"
 
-# MTProto containers stay reliable around this size even with medium-length copy.
-BURST = 48
-# Pacing between MTProto containers. Drafts are cheap; keep this snappy but
-# not so fast that Telegram flood-waits every container.
+# DMs / fires / broadcasts go out this many at a time.
+BURST = 500
+# Pacing between batches. Drafts are cheap; keep this snappy but
+# not so fast that Telegram flood-waits every batch.
 BURST_PACE = 0.35
-# Draft writing is much cheaper for Telegram than sending — run it wider.
-ARM_BURST = 64
+# Draft writing uses the same batch size as sends.
+ARM_BURST = 500
 ARM_PACE = 0.15
 # Flood policy: NO waiting. When Telegram demands a flood wait the item is
 # instantly marked flood_wait (retryable later) and the job moves on. Rapid
@@ -78,6 +78,11 @@ def _display_name(user: User | None, fallback_id: int = 0) -> str:
     parts = [user.first_name or "", user.last_name or ""]
     name = " ".join(p for p in parts if p).strip()
     return name or (f"@{user.username}" if user.username else f"user:{user.id}")
+
+
+def _is_disconnect(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return isinstance(exc, ConnectionError) or "disconnect" in msg or "not connected" in msg
 
 
 def _err_name(exc: BaseException) -> str:
@@ -168,6 +173,8 @@ class HydraEngine:
         self._listeners: set[asyncio.Queue] = set()
         self._lock = asyncio.Lock()
         self._job_lock = asyncio.Lock()
+        self._conn_lock = asyncio.Lock()
+        self._keep_task: Optional[asyncio.Task] = None
         # Chat list cache: Reload cooldown + stale fallback on Telegram floods.
         self._chats_cache: Optional[list[dict[str, Any]]] = None
         self._chats_ts: float = 0.0
@@ -184,6 +191,10 @@ class HydraEngine:
             device_model="HYDRA 324",
             system_version="Linux",
             app_version="0.1.0",
+            connection_retries=5,
+            retry_delay=1,
+            auto_reconnect=True,
+            timeout=15,
         )
         # Raise FloodWaitError instead of sleeping invisibly so the UI can show it.
         client.flood_sleep_threshold = 0
@@ -283,6 +294,7 @@ class HydraEngine:
                     await self._mark_online()
                     self.note("ok", "Resumed existing session.")
                     await self._restore_state()
+                    self.start_background()
                     return True
                 # Genuinely unauthorized (revoked/logged out elsewhere)
                 await self.client.disconnect()
@@ -420,6 +432,25 @@ class HydraEngine:
     def start_background(self) -> None:
         if (self.auto or {}).get("on"):
             self._ensure_auto_loop()
+        if self._keep_task is None or self._keep_task.done():
+            self._keep_task = asyncio.create_task(self._keepalive(), name="hydra-keepalive")
+
+    async def _keepalive(self) -> None:
+        """Ping Telegram so idle sockets (Render, NAT) don't die unnoticed."""
+        while True:
+            await asyncio.sleep(45)
+            if self.phase != "ready" or not self.client:
+                continue
+            try:
+                if not self.client.is_connected():
+                    await self._ensure()
+                else:
+                    await self.client.get_me()
+            except Exception:
+                try:
+                    await self._ensure(force=True)
+                except Exception:
+                    pass
 
     async def auto_start(
         self,
@@ -604,6 +635,7 @@ class HydraEngine:
             store.push_soon(self._k("session"), self.client.session.save())
         await self._mark_online()
         await self._restore_state()
+        self.start_background()
         self.note("ok", f"Session live as {self.me.get('name') if self.me else '?'}.")
         self.emit("status", **self.snapshot())
 
@@ -641,10 +673,95 @@ class HydraEngine:
         self.client = None
         self.phase = "logged_out"
 
+    def _client_live(self) -> bool:
+        c = self.client
+        return bool(c is not None and self.phase == "ready" and c.is_connected())
+
     def _need(self) -> TelegramClient:
         if not self.client or self.phase != "ready":
             raise RuntimeError("Session is not logged in.")
         return self.client
+
+    async def _ensure(self, *, force: bool = False) -> TelegramClient:
+        """Return a live Telegram client, reconnecting the saved session if the socket dropped.
+
+        HYDRA can still think you are logged in (phase=ready) after Render / NAT
+        kills the TCP link. Reload chats then raises
+        'Cannot send requests while disconnected' — this heals that.
+        """
+        async with self._conn_lock:
+            if not force and self._client_live():
+                assert self.client is not None
+                return self.client
+            await self._reconnect_unlocked(force=force)
+            if not self._client_live():
+                raise RuntimeError("Session is not logged in.")
+            assert self.client is not None
+            return self.client
+
+    async def _reconnect_unlocked(self, *, force: bool = False) -> None:
+        session_str: Optional[str] = None
+        if self.client:
+            try:
+                session_str = self.client.session.save()
+            except Exception:
+                pass
+            if not force and not self.client.is_connected():
+                self.note("warn", "Telegram connection dropped — reconnecting…")
+                try:
+                    await self.client.connect()
+                    if self.client.is_connected() and await self.client.is_user_authorized():
+                        self.phase = "ready"
+                        self.note("ok", "Reconnected to Telegram.")
+                        return
+                except Exception as exc:
+                    self.note("warn", f"Quick reconnect failed: {_err_name(exc)}")
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            self.client = None
+
+        if not session_str and self.session_path.exists():
+            try:
+                session_str = self.session_path.read_text().strip()
+            except Exception:
+                pass
+        if (not self.api_id or not self.api_hash) and self.creds_path.exists():
+            try:
+                creds = json.loads(self.creds_path.read_text())
+                self.api_id = int(creds["api_id"])
+                self.api_hash = creds["api_hash"]
+                self.phone = creds.get("phone") or self.phone
+            except Exception:
+                pass
+
+        if not session_str or not self.api_id or not self.api_hash:
+            ok = await self.try_resume()
+            if ok:
+                return
+            self.phase = "logged_out"
+            return
+
+        try:
+            self.client = self._make_client(StringSession(session_str))
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                await self.client.disconnect()
+                self.client = None
+                self.phase = "logged_out"
+                self.note("warn", "Session is no longer authorized — log in again.")
+                return
+            await self._mark_online()
+            self.note("ok", "Reconnected to Telegram.")
+        except Exception as exc:
+            if self.client:
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+            self.client = None
+            self.note("warn", f"Reconnect failed: {_err_name(exc)}")
 
     # ── chats & join requests ───────────────────────────────
     CHAT_CACHE_TTL = 300  # full dialog scans are heavy — cache results 5 min
@@ -656,30 +773,44 @@ class HydraEngine:
         thousands of dialogs with admin chats buried deep), so results are
         cached and concurrent reloads share a single scan.
         """
-        client = self._need()
         if self._chats_cache is not None and time.time() - self._chats_ts < self.CHAT_CACHE_TTL:
             return self._chats_cache
         async with self._chats_lock:  # single-flight: parallel taps share one scan
             if self._chats_cache is not None and time.time() - self._chats_ts < self.CHAT_CACHE_TTL:
                 return self._chats_cache
-            try:
-                out, complete = await self._fetch_admin_chats(client)
-            except FloodWaitError as exc:
-                wait = int(getattr(exc, "seconds", 20) or 20)
-                if self._chats_cache is not None:
-                    self.note(
-                        "warn",
-                        f"Telegram limited the chat reload ({wait}s) — showing the saved list.",
+            last_exc: Optional[BaseException] = None
+            for attempt in range(2):
+                try:
+                    client = await self._ensure(force=attempt > 0)
+                    out, complete = await self._fetch_admin_chats(client)
+                    self._chats_cache = out
+                    # Partial scans refresh sooner so a throttled crawl can continue.
+                    self._chats_ts = (
+                        time.time() - (self.CHAT_CACHE_TTL - 60) if not complete else time.time()
                     )
-                    return self._chats_cache
-                raise RuntimeError(
-                    f"Telegram asks to wait ~{wait}s before loading chats. "
-                    "Try again shortly — this eases off on its own."
-                ) from exc
-            self._chats_cache = out
-            # Partial scans refresh sooner so a throttled crawl can continue.
-            self._chats_ts = time.time() - (self.CHAT_CACHE_TTL - 60) if not complete else time.time()
-            return out
+                    return out
+                except FloodWaitError as exc:
+                    wait = int(getattr(exc, "seconds", 20) or 20)
+                    if self._chats_cache is not None:
+                        self.note(
+                            "warn",
+                            f"Telegram limited the chat reload ({wait}s) — showing the saved list.",
+                        )
+                        return self._chats_cache
+                    raise RuntimeError(
+                        f"Telegram asks to wait ~{wait}s before loading chats. "
+                        "Try again shortly — this eases off on its own."
+                    ) from exc
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt == 0 and _is_disconnect(exc):
+                        self.note(
+                            "warn",
+                            "Telegram was disconnected — reconnecting and retrying Reload.",
+                        )
+                        continue
+                    raise
+            raise RuntimeError(str(last_exc) if last_exc else "Could not load chats.")
 
     async def _fetch_admin_chats(self, client: TelegramClient) -> tuple[list[dict[str, Any]], bool]:
         out: list[dict[str, Any]] = []
@@ -750,7 +881,7 @@ class HydraEngine:
         return out, complete
 
     async def scan_pending(self, chats: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        client = self._need()
+        client = await self._ensure()
         admin_chats = [c for c in chats if c.get("admin")]
         self.note("ok", f"Scanning {len(admin_chats)} admin chats for join requests.")
 
@@ -783,7 +914,7 @@ class HydraEngine:
         return chats
 
     async def list_requests(self, chat_id: int) -> list[dict[str, Any]]:
-        client = self._need()
+        client = await self._ensure()
         peer = await client.get_input_entity(chat_id)
         people: list[dict[str, Any]] = []
         offset_date: Any = EPOCH
@@ -810,6 +941,12 @@ class HydraEngine:
                     "already-loaded people are kept; tap Reload to continue.",
                 )
                 break
+            except Exception as exc:
+                if _is_disconnect(exc):
+                    self.note("warn", "Disconnected while listing requests — reconnecting.")
+                    client = await self._ensure(force=True)
+                    continue
+                raise
             users = {u.id: u for u in result.users if isinstance(u, User)}
             if not result.importers:
                 break
@@ -873,7 +1010,7 @@ class HydraEngine:
 
         `commit`, if given, is called with the live results list after every
         container so callers can persist progress mid-job (crash-safe)."""
-        client = self._need()
+        client = await self._ensure()
         results: list[tuple[str, Any]] = [("pending", None)] * len(requests)
         chunk_size = int(burst or BURST)
         pace_s = float(pace if pace is not None else BURST_PACE)
@@ -895,6 +1032,8 @@ class HydraEngine:
             tries = 0
             while pending and not aborted and not job.cancel_requested:
                 tries += 1
+                if tries > 6:
+                    break
                 try:
                     raw = await client([chunk[i] for i in pending])
                     if not isinstance(raw, list):
@@ -925,6 +1064,13 @@ class HydraEngine:
                         job.errors.append({"user_id": ids[k], "error": f"flood_wait:{wait}"})
                     pending = []
                 except Exception as exc:
+                    if _is_disconnect(exc):
+                        self.note("warn", "Telegram disconnected mid-job — reconnecting.")
+                        try:
+                            client = await self._ensure(force=True)
+                            continue
+                        except Exception as exc2:
+                            self.note("warn", f"Reconnect failed: {_err_name(exc2)}")
                     self.note("warn", f"Container failed ({_err_name(exc)}); retrying peers one by one.")
                     for k in pending:
                         try:
@@ -1123,7 +1269,7 @@ class HydraEngine:
         async with self._job_lock:
             if not self.armed:
                 raise RuntimeError("Nothing is armed. Write drafts first.")
-            client = self._need()
+            client = await self._ensure()
             targets = list(self.armed)
             job = Job(id=f"fire-{int(time.time())}", kind="fire", total=len(targets))
             self.job = job
@@ -1283,7 +1429,7 @@ class HydraEngine:
             text = message.strip()
             if not text:
                 raise RuntimeError("Message is empty. Set it on the Message screen.")
-            client = self._need()
+            await self._ensure()
             targets = [
                 ArmedTarget(
                     user_id=int(uid),
@@ -1452,6 +1598,7 @@ class EnginePool:
             for name in ("creds", "session", "armed", "armed_uid", "sent", "dir", "auto"):
                 store.push_soon(f"{temp}:{name}", None)
         self._register(key, eng)
+        eng.start_background()
         return key
 
     async def switch(self, key: str) -> bool:
@@ -1494,24 +1641,36 @@ class EnginePool:
         return False
 
     async def self_heal(self) -> None:
-        """Watchdog: if no session restored at boot (transient Supabase /
-        Telegram failure), keep retrying every 45s until it reconnects —
-        instead of staying 'logged out' until the next deploy."""
+        """Watchdog: restore missing sessions AND reconnect dropped sockets.
+
+        An engine can stay phase=ready after Telegram/NAT kills the TCP
+        link; Reload chats then errors with 'Cannot send requests while
+        disconnected'. Ping those engines here so they heal without a
+        redeploy.
+        """
         while True:
             await asyncio.sleep(45)
             try:
-                if self.engines:
+                if not self.engines:
+                    if not await self._has_stored_sessions():
+                        continue  # user genuinely has no session yet
+                    await self.bootstrap()
+                    if self.engines:
+                        for e in self.engines.values():
+                            e.start_background()
+                        self.active().note(
+                            "ok",
+                            "Session reconnected automatically after a failed startup restore.",
+                        )
                     continue
-                if not await self._has_stored_sessions():
-                    continue  # user genuinely has no session yet
-                await self.bootstrap()
-                if self.engines:
-                    for e in self.engines.values():
-                        e.start_background()
-                    self.active().note(
-                        "ok",
-                        "Session reconnected automatically after a failed startup restore.",
-                    )
+                for e in list(self.engines.values()):
+                    try:
+                        if e.phase == "ready" and e.client and e.client.is_connected():
+                            continue
+                        if e.phase == "ready" or e.session_path.exists():
+                            await e._ensure()
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -1546,6 +1705,11 @@ class _EngineProxy:
 
     def __setattr__(self, name: str, value: Any) -> None:
         setattr(pool.active(), name, value)
+
+
+pool = EnginePool()
+engine = _EngineProxy()
+tattr(pool.active(), name, value)
 
 
 pool = EnginePool()
