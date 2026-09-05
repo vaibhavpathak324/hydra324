@@ -291,6 +291,17 @@ class HydraEngine:
                 self.note("warn", "Session is no longer authorized — log in again.")
                 return False
             except Exception as exc:
+                if "used under two different IP" in str(exc) or type(exc).__name__ == "AuthKeyDuplicatedError":
+                    # Permanently dead key (Telegram invalidated it) — stop
+                    # retrying and clear it so the watchdog doesn't loop.
+                    self.note(
+                        "warn",
+                        "Session invalidated by Telegram (the same login was used from "
+                        "two places). Log in again: Sessions → Add session.",
+                    )
+                    store.push_soon(self._k("session"), None)
+                    store.push_soon(self._k("creds"), None)
+                    return False
                 self.note(
                     "warn",
                     f"Could not resume session (attempt {attempt}/3): {_err_name(exc)}"

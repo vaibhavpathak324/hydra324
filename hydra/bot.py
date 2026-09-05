@@ -612,17 +612,29 @@ class BotController:
                 return "Already running."
             asyncio.create_task(self._job_wrap(engine.auto_force_pass), name="hydra-auto-pass")
             return "Pass started"
-        if data == "act:auto":
-            if engine.auto.get("on"):
-                await engine.auto_stop()
-                return "Auto-send stopped."
+        if data == "act:startdm":
+            if (engine.auto or {}).get("on"):
+                self.ws.screen = "auto"
+                return "Already running — see Progress."
             if not self.ws.selected_chat:
-                return "Pick a chat first."
+                return "Pick a chat first (Chats)."
             if not self.ws.selected_people():
-                return "Select requesters first (Requests screen)."
+                return "Select people first (Requests)."
             if not self.ws.message.strip():
-                return "Set the message first (Message screen)."
-            return self._confirm("auto")
+                return "Set the message first (Message)."
+            chat = self.ws.selected_chat
+            await engine.auto_start(
+                int(chat["id"]),
+                self.ws.selected_people(),
+                self.ws.message.strip(),
+                title=str(chat.get("title") or ""),
+            )
+            self.ws.screen = "auto"
+            return None
+        if data == "act:autodmstop":
+            await engine.auto_stop()
+            self.ws.screen = "auto"
+            return "Stopped."
 
         if data == "chats:load":
             return await self._load_chats()
@@ -736,11 +748,6 @@ class BotController:
             return "Preview sent below"
 
         confirms = {
-            "act:arm": "arm",
-            "act:fire": "fire",
-            "act:send": "send",
-            "act:inlinedm": "inlinedm",
-            "act:disarm": "disarm",
             "act:postinline": "postinline",
             "act:postsession": "postsession",
             "act:postbot": "postbot",
@@ -749,14 +756,8 @@ class BotController:
             return self._confirm(confirms[data])
 
         runners = {
-            "do:arm": self._run_arm,
-            "do:fire": self._run_fire,
-            "do:send": self._run_send,
-            "do:inlinedm": self._run_inline_dm,
-            "do:disarm": self._run_disarm,
             "do:logout": self._run_logout,
             "do:clrsent": self._run_clr_sent,
-            "do:auto": self._run_auto_on,
             "do:bcast": self._run_bcast,
             "do:sesrm": self._run_rm_session,
             "do:postinline": self._run_post_inline,
@@ -956,45 +957,8 @@ class BotController:
             raise RuntimeError("Set the message first.")
         return self.ws.message
 
-    async def _run_arm(self) -> None:
-        chat = self._need_chat()
-        await engine.arm_drafts(int(chat["id"]), self.ws.selected_people(), self._need_message())
-
-    async def _run_fire(self) -> None:
-        await engine.fire_drafts()
-
-    async def _run_send(self) -> None:
-        chat = self._need_chat()
-        await engine.send_now(int(chat["id"]), self.ws.selected_people(), self._need_message())
-
-    async def _run_inline_dm(self) -> None:
-        if not self.username:
-            raise RuntimeError("Control bot username unknown.")
-        chat = self._need_chat()
-        key = self.stash_inline()
-        await engine.dm_via_inline(
-            self.ws.selected_people(),
-            self.username,
-            key,
-            int(chat["id"]),
-            self._need_message(),
-        )
-
-    async def _run_disarm(self) -> None:
-        await engine.disarm()
-
     async def _run_clr_sent(self) -> None:
         await engine.clear_sent()
-
-    async def _run_auto_on(self) -> None:
-        chat = self.ws.selected_chat or {}
-        await engine.auto_start(
-            int(chat["id"]),
-            self.ws.selected_people(),
-            self.ws.message.strip(),
-            title=str(chat.get("title") or ""),
-        )
-        self.ws.screen = "auto"
 
     async def _run_bcast(self) -> None:
         await engine.broadcast(self.ws.message.strip())

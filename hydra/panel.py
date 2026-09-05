@@ -77,7 +77,6 @@ def render(engine, ws, bot_username: str = "") -> tuple[str, InlineKeyboardMarku
         "wait": wait,
         "confirm": confirm,
         "job": job,
-        "drafts": drafts,
         "auto": auto_progress,
     }.get(screen, home)
     return fn(engine, ws, bot_username)
@@ -102,7 +101,7 @@ def home(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         f"Session     {session_line(engine)}{more}\n"
         f"Chat        {chat_s}\n"
         f"Requests    {n_ppl} loaded · {n_sel} selected\n"
-        f"Drafts      {len(engine.armed)} armed\n"
+        f"DMs sent    {len(engine.sent_ids)}\n"
         f"Message     {preview_msg(ws.message, 90)}\n"
         f"Buttons     {len(ws.buttons)} row · {n_btn} links\n"
     )
@@ -274,36 +273,6 @@ def buttons(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     return text, kb(rows)
 
 
-def drafts(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
-    armed = engine.armed
-    if armed:
-        unique: list[str] = []
-        for t in armed:
-            if t.message not in unique:
-                unique.append(t.message)
-        preview = esc(unique[0][:700])
-        extra = f"\n\n<i>(+ {len(unique) - 1} different message(s) across drafts)</i>" if len(unique) > 1 else ""
-        text = (
-            "<b>Draft status</b>\n\n"
-            f"Drafts written, waiting to send: <b>{len(armed)}</b>\n\n"
-            f"<b>Draft message:</b>\n{preview}{extra}\n\n"
-            "<i>Write drafts resumes — people who already have a draft are skipped. "
-            "It starts over only after Send all drafts or Clear drafts.</i>"
-        )
-    else:
-        text = (
-            "<b>Draft status</b>\n\n"
-            "No drafts written.\n\n"
-            "Actions → Write drafts — don't send."
-        )
-    rows = [
-        [B("Refresh", "go:drafts")],
-        [B("Send all drafts", "act:fire"), B("Clear drafts", "act:disarm")],
-        nav(),
-    ]
-    return text, kb(rows)
-
-
 def auto_progress(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     st = engine.auto_status()
     if not st["on"]:
@@ -351,40 +320,33 @@ def auto_progress(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMar
 def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     n = len(ws.selected_people())
     auto = engine.auto_status()
+    chat = ws.selected_chat.get("title") if ws.selected_chat else None
+    msg = esc(ws.message.strip()[:80]) if ws.message.strip() else "<i>unset</i>"
     if auto["on"]:
-        auto_line = (
-            f"on · {auto['remaining']} left · next pass in ~{max(1, auto['next_in'])}s "
-            f"(every {auto['interval']}s)"
+        status = (
+            f"🟢 Running · {int((engine.auto or {}).get('sent_total', 0) or 0)} sent "
+            f"· {auto['remaining']} left"
         )
     else:
-        auto_line = f"off (every {auto['interval']}s when on)"
-    draft_msg = esc(ws.message.strip()[:80]) if ws.message.strip() else "<i>unset</i>"
+        status = "⚪ Not running"
     text = (
         "<b>Actions</b>\n\n"
-        f"Selected requesters: <b>{n}</b>\n"
-        f"Armed drafts: <b>{len(engine.armed)}</b>\n"
-        f"Broadcast list: <b>{len(engine.dmdir)}</b> known DMs\n"
-        f"Auto-send: <b>{auto_line}</b>\n\n"
-        f"Message copy: {draft_msg}\n\n"
-        "Write drafts fills each DM compose box and does <b>not</b> send.\n"
-        "Send all drafts is the one-click release.\n"
-        "Auto-send keeps DMing the unsent selection automatically until done.\n"
-        "Broadcast re-DMs everyone on the broadcast list."
+        f"Message:  {msg}\n"
+        f"Selected: {n} people" + (f" in {esc(str(chat))}" if chat else "") + "\n"
+        f"{status}\n\n"
+        "<i>Start DMs sends your message to everyone selected and keeps going "
+        "automatically until all are DMed. Nobody gets two DMs.</i>"
+    )
+    main = (
+        [B("⏹ Stop DMs", "act:autodmstop")]
+        if auto["on"]
+        else [B("🚀 Start DMs", "act:startdm")]
     )
     rows = [
-        [B("Write drafts — don’t send", "act:arm")],
-        [B("Send all drafts", "act:fire")],
-        [B("Send DMs now", "act:send")],
-        [B("Send DMs with buttons", "act:inlinedm")],
-        [B("Clear drafts", "act:disarm")],
-        [B("📄 Draft status", "go:drafts")],
-        [B("📢 Broadcast", "act:bcast")],
-        [B(
-            f"Auto-send: {'ON — tap to stop' if auto['on'] else 'OFF — tap to start'}",
-            "act:auto",
-        )],
-        [B(f"📊 Auto progress · {auto['remaining']} left" if auto["on"] else "📊 Auto progress", "go:auto")],
-        [B("Auto interval", "act:autoint")],
+        main,
+        [B("📊 Progress", "go:auto")],
+        [B(f"⏱ Speed · every {auto['interval']}s", "act:autoint")],
+        [B("📢 Broadcast to all known DMs", "act:bcast")],
         nav(),
     ]
     return text, kb(rows)
@@ -480,16 +442,6 @@ def confirm(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     action = ws.pending or ""
     n = len(ws.selected_people())
     copies = {
-        "arm": (
-            "Write unsent drafts",
-            f"Place the message in <b>{n}</b> requester DMs as drafts. Nothing is sent.",
-            "do:arm",
-        ),
-        "fire": (
-            "Send all drafts",
-            f"Release <b>{len(engine.armed)}</b> armed drafts now.",
-            "do:fire",
-        ),
         "clrsent": (
             "Clear DM history",
             f"Forget the <b>{len(engine.sent_ids)}</b> stored already-DMed records. "
@@ -508,28 +460,6 @@ def confirm(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
             f"Log out and remove <code>{esc(str(ws.login.get('_rmkey', '')))}</code>? "
             "Its drafts and DM history for that account are deleted.",
             "do:sesrm",
-        ),
-        "send": (
-            "Send DMs now",
-            f"Send the message immediately to <b>{n}</b> requesters.",
-            "do:send",
-        ),
-        "auto": (
-            "Auto-send ON",
-            f"Keep DMing the unsent selection automatically — one pass every "
-            f"<b>{int((engine.auto or {}).get('interval', 30) or 30)}s</b> until everyone "
-            "is DMed. Nobody gets two DMs.",
-            "do:auto",
-        ),
-        "inlinedm": (
-            "Send DMs with buttons",
-            f"The session sends the button message to <b>{n}</b> requesters via inline mode.",
-            "do:inlinedm",
-        ),
-        "disarm": (
-            "Clear drafts",
-            f"Erase {len(engine.armed)} armed drafts from DMs.",
-            "do:disarm",
         ),
         "logout": (
             "Log out session",
