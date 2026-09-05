@@ -646,6 +646,17 @@ class HydraEngine:
             raise RuntimeError("Session is not logged in.")
         return self.client
 
+    async def ensure_connected(self) -> None:
+        """Heal a dropped TCP connection ('Cannot send requests while
+        disconnected') — Telethon does not always reconnect on its own."""
+        client = self.client
+        if client and self.phase == "ready" and not client.is_connected():
+            try:
+                await client.connect()
+                self.note("ok", "Session connection re-established.")
+            except Exception as exc:
+                self.note("warn", f"Reconnect failed: {_err_name(exc)}")
+
     # ── chats & join requests ───────────────────────────────
     CHAT_CACHE_TTL = 300  # full dialog scans are heavy — cache results 5 min
 
@@ -662,6 +673,7 @@ class HydraEngine:
         async with self._chats_lock:  # single-flight: parallel taps share one scan
             if self._chats_cache is not None and time.time() - self._chats_ts < self.CHAT_CACHE_TTL:
                 return self._chats_cache
+            await self.ensure_connected()
             try:
                 out, complete = await self._fetch_admin_chats(client)
             except FloodWaitError as exc:
@@ -676,6 +688,19 @@ class HydraEngine:
                     f"Telegram asks to wait ~{wait}s before loading chats. "
                     "Try again shortly — this eases off on its own."
                 ) from exc
+            except Exception as exc:
+                if "disconnected" in str(exc).lower():
+                    # One reconnect + retry before giving up.
+                    await self.ensure_connected()
+                    try:
+                        out, complete = await self._fetch_admin_chats(client)
+                    except FloodWaitError as fw:
+                        wait = int(getattr(fw, "seconds", 20) or 20)
+                        raise RuntimeError(
+                            f"Telegram asks to wait ~{wait}s before loading chats."
+                        ) from fw
+                else:
+                    raise
             self._chats_cache = out
             # Partial scans refresh sooner so a throttled crawl can continue.
             self._chats_ts = time.time() - (self.CHAT_CACHE_TTL - 60) if not complete else time.time()
@@ -751,6 +776,7 @@ class HydraEngine:
 
     async def scan_pending(self, chats: list[dict[str, Any]]) -> list[dict[str, Any]]:
         client = self._need()
+        await self.ensure_connected()
         admin_chats = [c for c in chats if c.get("admin")]
         self.note("ok", f"Scanning {len(admin_chats)} admin chats for join requests.")
 
@@ -784,6 +810,7 @@ class HydraEngine:
 
     async def list_requests(self, chat_id: int) -> list[dict[str, Any]]:
         client = self._need()
+        await self.ensure_connected()
         peer = await client.get_input_entity(chat_id)
         people: list[dict[str, Any]] = []
         offset_date: Any = EPOCH
@@ -874,6 +901,7 @@ class HydraEngine:
         `commit`, if given, is called with the live results list after every
         container so callers can persist progress mid-job (crash-safe)."""
         client = self._need()
+        await self.ensure_connected()
         results: list[tuple[str, Any]] = [("pending", None)] * len(requests)
         chunk_size = int(burst or BURST)
         pace_s = float(pace if pace is not None else BURST_PACE)
@@ -904,6 +932,7 @@ class HydraEngine:
                         job.ok += 1
                     pending = []
                 except MultiError as exc:
+                    floods = 0
                     for i, err in enumerate(exc.exceptions):
                         k = pending[i] if i < len(pending) else None
                         if k is None:
@@ -911,18 +940,32 @@ class HydraEngine:
                         if err is None:
                             results[start + k] = ("ok", exc.results[i])
                             job.ok += 1
+                        elif isinstance(err, FloodWaitError):
+                            # Retryable: stays unsent, next pass picks it up.
+                            floods += 1
+                            results[start + k] = ("skip", None)
                         else:
                             results[start + k] = ("err", err)
                             job.fail += 1
                             job.errors.append({"user_id": ids[k], "error": _err_name(err)})
                     pending = []
+                    if floods and floods * 2 >= len(chunk):
+                        aborted = (
+                            f"Telegram's send window is full — {job.ok} sent this pass; "
+                            "the rest retry automatically next pass."
+                        )
                 except FloodWaitError as exc:
-                    # Whole container flood-limited: fail-fast, no waiting.
+                    # Whole container flood-limited: Telegram's window is full.
+                    # Mark this chunk retryable and END THE PASS early instead
+                    # of failing every container that follows (that artificial
+                    # ~one-container cap is what limited passes to ~50).
                     wait = int(getattr(exc, "seconds", 1) or 1)
                     for k in pending:
-                        results[start + k] = ("err", exc)
-                        job.fail += 1
-                        job.errors.append({"user_id": ids[k], "error": f"flood_wait:{wait}"})
+                        results[start + k] = ("skip", None)
+                    aborted = (
+                        f"Telegram's send window is full ({wait}s) — {job.ok} sent this pass; "
+                        "the rest retry automatically next pass."
+                    )
                     pending = []
                 except Exception as exc:
                     self.note("warn", f"Container failed ({_err_name(exc)}); retrying peers one by one.")
@@ -962,9 +1005,10 @@ class HydraEngine:
 
         # Anything never attempted is "skipped", not failed — callers keep them
         # armed / know they can be retried once Telegram relaxes the limit.
+        # Anything never attempted (or flood-skipped) is retryable, not failed.
         skipped = 0
         for i, (status, _) in enumerate(results):
-            if status == "pending":
+            if status in ("pending", "skip"):
                 results[i] = ("skip", None)
                 skipped += 1
         job.skipped = skipped
@@ -1494,13 +1538,20 @@ class EnginePool:
         return False
 
     async def self_heal(self) -> None:
-        """Watchdog: if no session restored at boot (transient Supabase /
-        Telegram failure), keep retrying every 45s until it reconnects —
-        instead of staying 'logged out' until the next deploy."""
+        """Watchdog: (a) reconnect sessions whose TCP connection dropped
+        ('Cannot send requests while disconnected'), (b) if nothing restored
+        at boot, keep retrying every 45s until it reconnects."""
         while True:
             await asyncio.sleep(45)
             try:
                 if self.engines:
+                    for e in self.engines.values():
+                        if e.client and not e.client.is_connected():
+                            try:
+                                await e.client.connect()
+                                e.note("ok", "Connection re-established by watchdog.")
+                            except Exception:
+                                pass
                     continue
                 if not await self._has_stored_sessions():
                     continue  # user genuinely has no session yet
