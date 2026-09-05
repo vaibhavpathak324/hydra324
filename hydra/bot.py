@@ -874,7 +874,9 @@ class BotController:
         self.ws.chat_page = 0
         self.ws.screen = "chats"
         self._ws_persist_core()
-        return f"{len(self.ws.chats)} chats"
+        if not self.ws.chats:
+            return "No admin chats — the session must be admin somewhere."
+        return f"{len(self.ws.chats)} admin chats"
 
     async def _scan_chats(self) -> str:
         if not self.ws.chats:

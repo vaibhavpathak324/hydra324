@@ -168,9 +168,9 @@ def chats(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     chunk = rows_data[start : start + CHATS_PER]
     filt = f"\nFilter: <code>{esc(ws.chat_filter)}</code>" if ws.chat_filter else ""
     text = (
-        "<b>Joined groups & channels</b>\n"
-        f"{len(rows_data)} chats{filt}\n"
-        "Tap one to work on it."
+        "<b>Admin chats</b>\n"
+        f"{len(rows_data)} chat(s) where you're admin{filt}\n"
+        "Only these can list join requests."
     )
     rows: list[list[InlineKeyboardButton]] = []
     for i, c in enumerate(chunk):

@@ -25,6 +25,7 @@ from telethon.errors import (
     UserPrivacyRestrictedError,
 )
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import GetAdminedPublicChannelsRequest
 
 from hydra import store
 from telethon.tl.functions.messages import (
@@ -169,6 +170,7 @@ class HydraEngine:
         # Chat list cache: Reload cooldown + stale fallback on Telegram floods.
         self._chats_cache: Optional[list[dict[str, Any]]] = None
         self._chats_ts: float = 0.0
+        self._chats_lock = asyncio.Lock()
 
     def _k(self, name: str) -> str:
         return name if self.skey == "main" else f"{self.skey}:{name}"
@@ -597,62 +599,107 @@ class HydraEngine:
         return self.client
 
     # ── chats & join requests ───────────────────────────────
-    async def list_chats(self) -> list[dict[str, Any]]:
-        client = self._need()
-        # Cooldown: repeated Reload taps must not hammer Telegram (each load
-        # is several GetDialogs requests) — serve the recent list instantly.
-        if self._chats_cache is not None and time.time() - self._chats_ts < 15:
-            return self._chats_cache
-        try:
-            out = await self._fetch_chats(client)
-        except FloodWaitError as exc:
-            wait = int(getattr(exc, "seconds", 20) or 20)
-            if self._chats_cache is not None:
-                self.note(
-                    "warn",
-                    f"Telegram limited the chat reload ({wait}s) — showing the saved list.",
-                )
-                return self._chats_cache
-            raise RuntimeError(
-                f"Telegram asks to wait ~{wait}s before loading chats. "
-                "Try again shortly — this eases off on its own."
-            ) from exc
-        self._chats_cache = out
-        self._chats_ts = time.time()
-        return out
+    CHAT_CACHE_TTL = 300  # full dialog scans are heavy — cache results 5 min
 
-    async def _fetch_chats(self, client: TelegramClient) -> list[dict[str, Any]]:
+    async def list_chats(self) -> list[dict[str, Any]]:
+        """Chats where this account is admin (the only ones with join requests).
+
+        A full scan walks the whole dialog list (the account may have
+        thousands of dialogs with admin chats buried deep), so results are
+        cached and concurrent reloads share a single scan.
+        """
+        client = self._need()
+        if self._chats_cache is not None and time.time() - self._chats_ts < self.CHAT_CACHE_TTL:
+            return self._chats_cache
+        async with self._chats_lock:  # single-flight: parallel taps share one scan
+            if self._chats_cache is not None and time.time() - self._chats_ts < self.CHAT_CACHE_TTL:
+                return self._chats_cache
+            try:
+                out, complete = await self._fetch_admin_chats(client)
+            except FloodWaitError as exc:
+                wait = int(getattr(exc, "seconds", 20) or 20)
+                if self._chats_cache is not None:
+                    self.note(
+                        "warn",
+                        f"Telegram limited the chat reload ({wait}s) — showing the saved list.",
+                    )
+                    return self._chats_cache
+                raise RuntimeError(
+                    f"Telegram asks to wait ~{wait}s before loading chats. "
+                    "Try again shortly — this eases off on its own."
+                ) from exc
+            self._chats_cache = out
+            # Partial scans refresh sooner so a throttled crawl can continue.
+            self._chats_ts = time.time() - (self.CHAT_CACHE_TTL - 60) if not complete else time.time()
+            return out
+
+    async def _fetch_admin_chats(self, client: TelegramClient) -> tuple[list[dict[str, Any]], bool]:
         out: list[dict[str, Any]] = []
-        # Bounded depth: unbounded iteration made each Reload fire one request
-        # per 100 dialogs, which is what kept re-triggering GetDialogs floods.
-        async for dialog in client.iter_dialogs(limit=500):
-            entity = dialog.entity
-            if isinstance(entity, User):
-                continue
-            kind = "group"
-            admin = False
-            username = getattr(entity, "username", None)
-            if isinstance(entity, Channel):
-                kind = "channel" if entity.broadcast else "supergroup"
-                admin = bool(entity.creator or entity.admin_rights)
-            elif isinstance(entity, Chat):
-                kind = "group"
-                admin = bool(getattr(entity, "creator", False) or getattr(entity, "admin_rights", None))
-            else:
-                continue
-            out.append(
-                {
-                    "id": dialog.id,
-                    "title": dialog.name,
-                    "kind": kind,
-                    "username": username,
-                    "admin": admin,
-                    "unread": dialog.unread_count,
-                    "pending": None,
-                }
+        seen: set[int] = set()
+        self.note("ok", "Scanning your chats for admin rights… (one-time, then cached)")
+        complete = True
+        try:
+            async for dialog in client.iter_dialogs(limit=4000):
+                entity = dialog.entity
+                if isinstance(entity, Channel):
+                    admin = bool(entity.creator or entity.admin_rights)
+                    kind = "channel" if entity.broadcast else "supergroup"
+                elif isinstance(entity, Chat):
+                    admin = bool(
+                        getattr(entity, "creator", False) or getattr(entity, "admin_rights", None)
+                    )
+                    kind = "group"
+                else:
+                    continue
+                if not admin or dialog.id in seen:
+                    continue
+                seen.add(dialog.id)
+                out.append(
+                    {
+                        "id": dialog.id,
+                        "title": dialog.name,
+                        "kind": kind,
+                        "username": getattr(entity, "username", None),
+                        "admin": True,
+                        "unread": dialog.unread_count,
+                        "pending": None,
+                    }
+                )
+        except FloodWaitError:
+            complete = False
+            self.note(
+                "warn",
+                f"Chat scan throttled by Telegram after {len(out)} admin chats — "
+                "tap Reload in a minute to continue the scan.",
             )
+        # Public channels where the account is admin but that sat outside the
+        # dialog window.
+        try:
+            res = await client(GetAdminedPublicChannelsRequest())
+            for ch in res.chats:
+                if ch.id in seen:
+                    continue
+                seen.add(ch.id)
+                out.append(
+                    {
+                        "id": ch.id,
+                        "title": ch.title,
+                        "kind": "channel" if getattr(ch, "broadcast", False) else "supergroup",
+                        "username": getattr(ch, "username", None),
+                        "admin": True,
+                        "unread": 0,
+                        "pending": None,
+                    }
+                )
+        except Exception:
+            pass
         out.sort(key=lambda c: (not c["admin"], c["title"].lower()))
-        return out
+        if not out:
+            self.note(
+                "warn",
+                "No admin chats found — join requests need the session to be admin.",
+            )
+        return out, complete
 
     async def scan_pending(self, chats: list[dict[str, Any]]) -> list[dict[str, Any]]:
         client = self._need()
