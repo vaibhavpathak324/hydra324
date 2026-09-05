@@ -601,6 +601,17 @@ class BotController:
         if data == "job:cancel":
             done = engine.cancel_job()
             return "Cancelling…" if done else "No job running."
+        if data == "auto:stop":
+            await engine.auto_stop()
+            self.ws.screen = "auto"
+            return "Auto-send stopped."
+        if data == "auto:pass":
+            if not (engine.auto or {}).get("on"):
+                return "Auto-send is off."
+            if self.busy:
+                return "Already running."
+            asyncio.create_task(self._job_wrap(engine.auto_force_pass), name="hydra-auto-pass")
+            return "Pass started"
         if data == "act:auto":
             if engine.auto.get("on"):
                 await engine.auto_stop()
@@ -981,8 +992,9 @@ class BotController:
             int(chat["id"]),
             self.ws.selected_people(),
             self.ws.message.strip(),
+            title=str(chat.get("title") or ""),
         )
-        self.ws.screen = "act"
+        self.ws.screen = "auto"
 
     async def _run_bcast(self) -> None:
         await engine.broadcast(self.ws.message.strip())

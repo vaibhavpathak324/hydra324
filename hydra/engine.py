@@ -117,6 +117,7 @@ class Job:
     status: str = "running"
     detail: str = ""
     cancel_requested: bool = False
+    touched: float = field(default_factory=time.time)
     errors: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -421,16 +422,25 @@ class HydraEngine:
             self._ensure_auto_loop()
 
     async def auto_start(
-        self, chat_id: int, people: list[dict[str, Any]], message: str, interval: Optional[int] = None
+        self,
+        chat_id: int,
+        people: list[dict[str, Any]],
+        message: str,
+        interval: Optional[int] = None,
+        title: Optional[str] = None,
     ) -> None:
         interval = int(interval or (self.auto or {}).get("interval") or 30)
         self.auto = {
             "on": True,
             "chat_id": int(chat_id),
+            "title": title or "",
             "people": list(people),
             "message": message,
             "interval": interval,
-            "next": time.time() + 20,
+            "next": time.time() + 10,
+            "passes": 0,
+            "sent_total": 0,
+            "last_result": "",
         }
         store.push_soon(self._k("auto"), self.auto)
         self._ensure_auto_loop()
@@ -455,19 +465,28 @@ class HydraEngine:
 
     async def _auto_loop(self) -> None:
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(3)
             try:
                 await self._auto_tick()
             except Exception as exc:
                 self.note("warn", f"Auto-send check failed: {_err_name(exc)}")
 
-    async def _auto_tick(self) -> None:
+    async def _auto_tick(self, force: bool = False) -> None:
         a = self.auto or {}
         if not a.get("on") or self.phase != "ready":
             return
-        if self.job and self.job.status == "running":
-            return
-        if time.time() < (a.get("next") or 0):
+        # A job left "running" by a crash used to block every future pass —
+        # recover instead: if it went quiet minutes ago, close it and go on.
+        j = self.job
+        if j and j.status == "running":
+            if time.time() - getattr(j, "touched", 0) > 120:
+                j.status = "done"
+                j.detail = "Recovered an interrupted job — auto-send continues."
+                self.note("warn", j.detail)
+                self.emit("job", job=j.as_dict())
+            else:
+                return  # genuinely still sending
+        if not force and time.time() < (a.get("next") or 0):
             return
         remaining = self._auto_remaining()
         if not remaining:
@@ -476,14 +495,43 @@ class HydraEngine:
             self.note("ok", "Auto-send finished — everyone in the selection has been DMed. ✅")
             self.emit("status", **self.snapshot())
             return
-        self.note("ok", f"Auto-send pass: {len(remaining)} still unsent, sending now.")
+        self.note("ok", f"Auto-send pass {int(a.get('passes', 0)) + 1}: {len(remaining)} unsent, sending.")
+        passes = int(a.get("passes", 0)) + 1
+        sent_total = int(a.get("sent_total", 0))
         try:
-            await self.send_now(int(a["chat_id"]), remaining, a["message"])
+            result = await self.send_now(int(a["chat_id"]), remaining, a["message"])
+            jinfo = result.get("job") or {}
+            ok = int(jinfo.get("ok") or 0)
+            sent_total += ok
+            last = f"+{ok} sent · {int(jinfo.get('fail') or 0)} failed"
         except Exception as exc:
+            if "No one left" in str(exc):
+                self.auto = {**a, "on": False}
+                store.push_soon(self._k("auto"), self.auto)
+                self.note(
+                    "ok", "Auto-send finished — the rest can't be DMed (unreachable)."
+                )
+                self.emit("status", **self.snapshot())
+                return
+            last = f"pass failed: {_err_name(exc)}"
             self.note("warn", f"Auto-send pass: {_err_name(exc)}")
-        a["next"] = time.time() + int(a.get("interval", 30) or 30)
+        a = dict(a)
+        a.update(
+            {
+                "passes": passes,
+                "sent_total": sent_total,
+                "last_result": last,
+                "next": time.time() + int(a.get("interval", 30) or 30),
+            }
+        )
+        self.auto = a
         store.push_soon(self._k("auto"), a)
         self.emit("status", **self.snapshot())
+
+    async def auto_force_pass(self) -> None:
+        """Run an auto-send pass immediately (Auto progress → Send a pass now)."""
+        if (self.auto or {}).get("on"):
+            await self._auto_tick(force=True)
 
     # ── auth ────────────────────────────────────────────────
     async def start_login(self, api_id: int, api_hash: str, phone: str) -> dict[str, Any]:
@@ -836,6 +884,7 @@ class HydraEngine:
             if job.cancel_requested:
                 aborted = "Cancelled — the rest are kept for retry."
                 break
+            job.touched = time.time()
             chunk = requests[start : start + chunk_size]
             ids = user_ids[start : start + chunk_size]
             job.detail = f"{label} · container {start // chunk_size + 1}/{(len(requests) - 1) // chunk_size + 1}"

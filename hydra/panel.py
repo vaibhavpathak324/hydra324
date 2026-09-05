@@ -78,6 +78,7 @@ def render(engine, ws, bot_username: str = "") -> tuple[str, InlineKeyboardMarku
         "confirm": confirm,
         "job": job,
         "drafts": drafts,
+        "auto": auto_progress,
     }.get(screen, home)
     return fn(engine, ws, bot_username)
 
@@ -303,6 +304,50 @@ def drafts(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     return text, kb(rows)
 
 
+def auto_progress(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    st = engine.auto_status()
+    if not st["on"]:
+        text = (
+            "<b>Auto-send</b>\n\n"
+            "Off.\n\n"
+            "To start: pick a chat in Chats, select people in Requests, "
+            "set the Message, then Actions → Auto-send."
+        )
+        rows = [
+            [B("Open Actions", "go:act")],
+            nav(),
+        ]
+        return text, kb(rows)
+    a = engine.auto or {}
+    j = engine.job
+    prog = ""
+    if j and j.status == "running" and j.kind == "send":
+        pct = int(round(100 * j.done / j.total)) if j.total else 0
+        prog = (
+            f"\n\n<b>Pass in progress</b>\n<code>{bar(j.done, j.total)}</code>  {pct}%\n"
+            f"{j.done}/{j.total} · ok {j.ok} · fail {j.fail}"
+        )
+    elif a.get("last_result"):
+        prog = f"\n\nLast pass: <b>{esc(str(a['last_result']))}</b>"
+    text = (
+        "<b>Auto-send · ON</b>\n"
+        f"Chat: {esc(str(a.get('title') or a.get('chat_id') or '—'))}\n\n"
+        f"Sent so far: <b>{int(a.get('sent_total', 0) or 0)}</b>\n"
+        f"Still unsent: <b>{st['remaining']}</b>\n"
+        f"Passes done: <b>{int(a.get('passes', 0) or 0)}</b>\n"
+        f"Interval: every {st['interval']}s · next pass in ~{max(1, st['next_in'])}s"
+        f"{prog}\n\n"
+        "<i>Runs until everyone is DMed or you stop it. Nobody gets two DMs.</i>"
+    )
+    rows = [
+        [B("⏹ Stop auto-send", "auto:stop")],
+        [B("⚡ Send a pass now", "auto:pass")],
+        [B("Refresh", "go:auto")],
+        nav(),
+    ]
+    return text, kb(rows)
+
+
 def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     n = len(ws.selected_people())
     auto = engine.auto_status()
@@ -338,6 +383,7 @@ def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
             f"Auto-send: {'ON — tap to stop' if auto['on'] else 'OFF — tap to start'}",
             "act:auto",
         )],
+        [B(f"📊 Auto progress · {auto['remaining']} left" if auto["on"] else "📊 Auto progress", "go:auto")],
         [B("Auto interval", "act:autoint")],
         nav(),
     ]
