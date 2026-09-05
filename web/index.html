@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HYDRA 324</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600&family=Syne:wght@700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="bot-bar" class="bot-bar">
+    <span class="kicker" style="margin:0">control bot</span>
+    <form id="form-bot" class="bot-form">
+      <input id="bot_token" autocomplete="off" placeholder="Paste bot token from @BotFather" />
+      <button type="submit" class="btn tiny primary">Start bot</button>
+    </form>
+    <p id="bot-status" class="bot-status">Token starts the Telegram button panel. Session login still needed for join requests.</p>
+  </div>
+
+  <div id="login" class="login">
+    <div class="login-rail"></div>
+    <div class="login-body">
+      <p class="kicker">session command</p>
+      <h1>HYDRA<span>324</span></h1>
+      <p class="lede">Log in a Telegram <em>account session</em>. The panel then reads groups you already joined, lists pending join requests, and DMs those people without approving or declining them.</p>
+
+      <form id="form-start" class="stack">
+        <label>API ID
+          <input id="api_id" inputmode="numeric" autocomplete="off" placeholder="12345678" required />
+        </label>
+        <label>API Hash
+          <input id="api_hash" autocomplete="off" placeholder="from my.telegram.org" required />
+        </label>
+        <label>Phone
+          <input id="phone" autocomplete="tel" placeholder="+447700900123" required />
+        </label>
+        <button type="submit" class="btn primary" id="btn-start">Request login code</button>
+      </form>
+
+      <form id="form-code" class="stack hidden">
+        <label>Login code
+          <input id="code" autocomplete="one-time-code" placeholder="12345" required />
+        </label>
+        <button type="submit" class="btn primary">Confirm code</button>
+      </form>
+
+      <form id="form-pass" class="stack hidden">
+        <label>Two-step password
+          <input id="password" type="password" autocomplete="current-password" required />
+        </label>
+        <button type="submit" class="btn primary">Unlock session</button>
+      </form>
+
+      <details class="alt">
+        <summary>Or paste an existing session string</summary>
+        <form id="form-string" class="stack">
+          <label>API ID
+            <input id="s_api_id" inputmode="numeric" required />
+          </label>
+          <label>API Hash
+            <input id="s_api_hash" required />
+          </label>
+          <label>Session string
+            <textarea id="s_string" rows="3" required></textarea>
+          </label>
+          <button type="submit" class="btn">Open session</button>
+        </form>
+      </details>
+
+      <p id="login-err" class="err" hidden></p>
+      <p class="foot">API ID + hash come from <a href="https://my.telegram.org" target="_blank" rel="noreferrer">my.telegram.org</a>. A bot token cannot see join requesters or write user DMs — this is a user session.</p>
+    </div>
+  </div>
+
+  <div id="app" class="app hidden">
+    <header class="top">
+      <div class="brand">
+        <strong>HYDRA</strong>
+        <span>324</span>
+      </div>
+      <div class="me">
+        <span class="pulse" id="pulse"></span>
+        <span id="me-name">—</span>
+        <span id="me-user" class="dim"></span>
+      </div>
+      <div class="top-actions">
+        <button class="btn ghost" id="btn-export">Export session</button>
+        <button class="btn ghost" id="btn-logout">Log out</button>
+      </div>
+    </header>
+
+    <section class="stage">
+      <aside class="pane chats">
+        <div class="pane-h">
+          <h2>Joined chats</h2>
+          <div class="row">
+            <button class="btn tiny" id="btn-refresh">Reload</button>
+            <button class="btn tiny" id="btn-scan">Scan requests</button>
+          </div>
+        </div>
+        <input id="chat-filter" class="filter" placeholder="Filter groups & channels" />
+        <ul id="chat-list" class="list"></ul>
+      </aside>
+
+      <main class="pane people">
+        <div class="pane-h">
+          <div>
+            <h2 id="people-title">Join requests</h2>
+            <p class="sub" id="people-sub">Select a group or channel. Requests are read only — never accepted or declined.</p>
+          </div>
+          <div class="row">
+            <label class="check"><input type="checkbox" id="sel-all" /> all</label>
+            <span id="sel-count" class="count">0 selected</span>
+          </div>
+        </div>
+        <input id="people-filter" class="filter" placeholder="Filter requesters" />
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th></th>
+                <th>Name</th>
+                <th>Username</th>
+                <th>When</th>
+                <th>Note</th>
+              </tr>
+            </thead>
+            <tbody id="people-body">
+              <tr class="empty"><td colspan="5">No chat selected.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </main>
+
+      <aside class="pane log">
+        <div class="pane-h"><h2>Log</h2></div>
+        <ol id="log-list" class="log-list"></ol>
+      </aside>
+    </section>
+
+    <footer class="dock">
+      <div class="dock-msg">
+        <label for="message">Same DM for every selected requester</label>
+        <textarea id="message" rows="3" placeholder="Write the message that will be placed in each requester’s DM."></textarea>
+      </div>
+      <div class="dock-actions">
+        <div class="armed-readout">
+          <span class="k">armed drafts</span>
+          <span id="armed-n" class="n">0</span>
+        </div>
+        <button class="btn primary" id="btn-arm" title="Write the message in each DM as a draft. Nothing is sent.">Write drafts, don’t send</button>
+        <button class="btn fire" id="btn-fire" disabled>Send all drafts</button>
+        <button class="btn" id="btn-send">Send DMs now</button>
+        <button class="btn ghost" id="btn-disarm">Clear drafts</button>
+      </div>
+      <div id="progress" class="progress hidden">
+        <div class="bar"><i id="bar-fill"></i></div>
+        <span id="progress-text"></span>
+      </div>
+    </footer>
+  </div>
+
+  <dialog id="confirm" class="confirm">
+    <p id="confirm-text"></p>
+    <div class="row">
+      <button class="btn" id="confirm-no">Cancel</button>
+      <button class="btn primary" id="confirm-yes">Do it</button>
+    </div>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

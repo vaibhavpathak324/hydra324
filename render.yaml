@@ -1,0 +1,15 @@
+# Render blueprint for HYDRA 324.
+# Secrets (HYDRA_BOT_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH, OWNER_ID,
+# DATABASE_URL) are set in the Render dashboard / API, not in this file.
+services:
+  - type: web
+    name: hydra324
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m hydra --port $PORT
+    healthCheckPath: /api/status
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
