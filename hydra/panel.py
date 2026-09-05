@@ -308,11 +308,11 @@ def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     auto = engine.auto_status()
     if auto["on"]:
         auto_line = (
-            f"on · {auto['remaining']} left · next pass in ~{max(1, auto['next_in'] // 60 + 1)} min "
-            f"(every {auto['interval']} min)"
+            f"on · {auto['remaining']} left · next pass in ~{max(1, auto['next_in'])}s "
+            f"(every {auto['interval']}s)"
         )
     else:
-        auto_line = f"off (interval {auto['interval']} min)"
+        auto_line = f"off (every {auto['interval']}s when on)"
     draft_msg = esc(ws.message.strip()[:80]) if ws.message.strip() else "<i>unset</i>"
     text = (
         "<b>Actions</b>\n\n"
@@ -384,7 +384,7 @@ def logs(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
 
 
 def settings(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
-    from hydra.engine import FLOOD, pool
+    from hydra.engine import pool
 
     bot = f"@{esc(bot_username)}" if bot_username else "—"
     n_sessions = len(pool.summary())
@@ -392,8 +392,7 @@ def settings(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "<b>Settings</b>\n\n"
         f"Control bot    {bot}\n"
         f"Session        {session_line(engine)}\n"
-        f"Sessions       {n_sessions}\n"
-        f"Flood waits    sleep ≤ <b>{FLOOD['cap']:.0f}s</b>, retry twice, move on\n\n"
+        f"Sessions       {n_sessions}\n\n"
         "This bot only answers the first Telegram account that opens it "
         "(the owner). Everyone else is ignored.\n\n"
         "Inline mode: @BotFather → your bot → Bot Settings → Inline Mode → On.\n"
@@ -403,7 +402,6 @@ def settings(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         [B("Refresh panel", "go:home")],
         [B("Export session", "sess:export")],
         [B(f"Clear DM history ({len(engine.sent_ids)})", "act:clrsent")],
-        [B(f"Flood wait cap · {FLOOD['cap']:.0f}s", "set:flood")],
         nav(),
     ]
     return text, kb(rows)
@@ -424,8 +422,7 @@ def wait(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "btn_url": ("Add button", "2 / 2 · URL", "Send the URL, including https://"),
         "chat_filter": ("Filter chats", "", "Send text to match titles. Send a single dash (-) to clear."),
         "people_filter": ("Filter people", "", "Send text to match names. Send a single dash (-) to clear."),
-        "autoint": ("Auto-send interval", "", "Send the minutes between automatic passes (10–1440)."),
-        "floodset": ("Flood wait cap", "", "Send the maximum seconds to sleep on a Telegram flood wait (3–60). After two retries the item is marked failed and the job moves on — no long pauses."),
+        "autoint": ("Auto-send interval", "", "Send the seconds between automatic passes (3–120)."),
     }
     title, step, hint = prompts.get(ws.waiting or "", ("HYDRA", "", "Send your next message."))
     step_l = f"\n{esc(step)}\n" if step else "\n"
@@ -470,6 +467,13 @@ def confirm(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
             "Send DMs now",
             f"Send the message immediately to <b>{n}</b> requesters.",
             "do:send",
+        ),
+        "auto": (
+            "Auto-send ON",
+            f"Keep DMing the unsent selection automatically — one pass every "
+            f"<b>{int((engine.auto or {}).get('interval', 30) or 30)}s</b> until everyone "
+            "is DMed. Nobody gets two DMs.",
+            "do:auto",
         ),
         "inlinedm": (
             "Send DMs with buttons",

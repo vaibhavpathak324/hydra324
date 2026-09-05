@@ -535,9 +535,6 @@ class BotController:
             self.ws.screen = self.ws.return_screen or "home"
             return "Cancelled"
 
-        if data == "set:flood":
-            return self._ask("floodset", "set")
-
         if data.startswith("go:"):
             dest = data.split(":", 1)[1]
             self.ws.waiting = None
@@ -860,24 +857,13 @@ class BotController:
             return "Filtered"
         if w == "autoint":
             try:
-                n = max(10, min(1440, int(text.strip())))
+                n = max(3, min(120, int(text.strip())))
             except ValueError:
                 return self._ask("autoint", "act")
             engine.auto_set_interval(n)
             self.ws.waiting = None
             self.ws.screen = "act"
-            return f"Auto-send interval: every {n} min"
-        if w == "floodset":
-            from hydra.engine import set_flood_cap
-
-            try:
-                n = int(float(text.strip()))
-            except ValueError:
-                return self._ask("floodset", "set")
-            cap = set_flood_cap(n)
-            self.ws.waiting = None
-            self.ws.screen = "set"
-            return f"Flood waits now sleep at most {cap:.0f}s, then retry twice and move on."
+            return f"Auto-send interval: every {n}s"
         return None
 
     async def _load_chats(self) -> str:
@@ -994,6 +980,7 @@ class BotController:
             self.ws.selected_people(),
             self.ws.message.strip(),
         )
+        self.ws.screen = "act"
 
     async def _run_bcast(self) -> None:
         await engine.broadcast(self.ws.message.strip())

@@ -60,20 +60,10 @@ BURST_PACE = 0.35
 # Draft writing is much cheaper for Telegram than sending — run it wider.
 ARM_BURST = 64
 ARM_PACE = 0.15
-# Flood-wait override (user setting, min 3s): when Telegram demands a wait,
-# sleep only this long, retry FLOOD_RETRIES times, then mark the item as
-# flood_wait and MOVE ON — no long pauses, no aborted jobs. Telegram may
-# re-demand the wait on early retries; those items simply fail fast and stay
-# retryable (drafts remain armed, sent-history is only recorded on success).
-FLOOD = {"cap": 3.0}
-FLOOD_RETRIES = 2
-
-
-def set_flood_cap(seconds: float) -> float:
-    cap = max(3.0, min(60.0, float(seconds)))
-    FLOOD["cap"] = cap
-    store.push_soon("flood_cap", cap)
-    return cap
+# Flood policy: NO waiting. When Telegram demands a flood wait the item is
+# instantly marked flood_wait (retryable later) and the job moves on. Rapid
+# re-passes (auto-send every few seconds) pick items up as Telegram allows.
+FLOOD_RETRIES = 0
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -441,7 +431,7 @@ class HydraEngine:
         self._ensure_auto_loop()
         self.note(
             "ok",
-            f"Auto-send ON — {len(self._auto_remaining())} to DM, one pass every {interval} min.",
+            f"Auto-send ON — {len(self._auto_remaining())} to DM, one pass every {interval}s.",
         )
         self.emit("status", **self.snapshot())
 
@@ -451,9 +441,9 @@ class HydraEngine:
         self.note("ok", "Auto-send stopped.")
         self.emit("status", **self.snapshot())
 
-    def auto_set_interval(self, minutes: int) -> None:
+    def auto_set_interval(self, seconds: int) -> None:
         a = dict(self.auto or {})
-        a["interval"] = max(10, min(1440, int(minutes)))
+        a["interval"] = max(3, min(120, int(seconds)))
         a.setdefault("on", False)
         self.auto = a
         store.push_soon(self._k("auto"), a)
@@ -486,7 +476,7 @@ class HydraEngine:
             await self.send_now(int(a["chat_id"]), remaining, a["message"])
         except Exception as exc:
             self.note("warn", f"Auto-send pass: {_err_name(exc)}")
-        a["next"] = time.time() + int(a.get("interval", 30) or 30) * 60
+        a["next"] = time.time() + int(a.get("interval", 30) or 30)
         store.push_soon(self._k("auto"), a)
         self.emit("status", **self.snapshot())
 
@@ -677,7 +667,6 @@ class HydraEngine:
         offset_user: Any = InputUserEmpty()
         seen: set[int] = set()
         pages = 0
-        flood_budget = 300  # seconds of flood-wait tolerated while listing
 
         while True:
             try:
@@ -692,20 +681,12 @@ class HydraEngine:
                 )
             except FloodWaitError as exc:
                 wait = int(getattr(exc, "seconds", 1) or 1)
-                if flood_budget <= 0:
-                    self.note(
-                        "warn",
-                        f"Listing paused at {len(people)} — Telegram is throttling. "
-                        "Open Requests again later to load the rest.",
-                    )
-                    break
-                flood_budget -= FLOOD["cap"]
                 self.note(
                     "warn",
-                    f"Flood wait {wait}s while listing — continuing after {FLOOD['cap']:.0f}s.",
+                    f"Telegram throttled the listing at {len(people)} (flood {wait}s) — "
+                    "already-loaded people are kept; tap Reload to continue.",
                 )
-                await asyncio.sleep(FLOOD["cap"] + 0.5)
-                continue
+                break
             users = {u.id: u for u in result.users if isinstance(u, User)}
             if not result.importers:
                 break
@@ -799,8 +780,6 @@ class HydraEngine:
                         job.ok += 1
                     pending = []
                 except MultiError as exc:
-                    retry: list[int] = []
-                    max_wait = 0
                     for i, err in enumerate(exc.exceptions):
                         k = pending[i] if i < len(pending) else None
                         if k is None:
@@ -808,51 +787,19 @@ class HydraEngine:
                         if err is None:
                             results[start + k] = ("ok", exc.results[i])
                             job.ok += 1
-                        elif isinstance(err, FloodWaitError):
-                            # Per-item flood: retry just these after the cap.
-                            retry.append(k)
-                            max_wait = max(max_wait, int(getattr(err, "seconds", 1) or 1))
                         else:
                             results[start + k] = ("err", err)
                             job.fail += 1
                             job.errors.append({"user_id": ids[k], "error": _err_name(err)})
-                    if not retry:
-                        pending = []
-                        break
-                    if tries > FLOOD_RETRIES:
-                        for k in retry:
-                            results[start + k] = ("err", None)
-                            job.fail += 1
-                            job.errors.append(
-                                {"user_id": ids[k], "error": f"flood_wait:{max_wait}"}
-                            )
-                        pending = []
-                        break
-                    job.detail = (
-                        f"Flood wait {max_wait}s on {len(retry)} items — "
-                        f"retrying in {FLOOD['cap']:.0f}s ({job.ok}/{len(requests)} done)"
-                    )
-                    self.emit("job", job=job.as_dict())
-                    await asyncio.sleep(FLOOD["cap"] + 0.5)
-                    pending = retry
+                    pending = []
                 except FloodWaitError as exc:
-                    # Whole container rejected: nothing executed, safe to retry all.
+                    # Whole container flood-limited: fail-fast, no waiting.
                     wait = int(getattr(exc, "seconds", 1) or 1)
-                    if tries > FLOOD_RETRIES:
-                        for k in pending:
-                            results[start + k] = ("err", exc)
-                            job.fail += 1
-                            job.errors.append(
-                                {"user_id": ids[k], "error": f"flood_wait:{wait}"}
-                            )
-                        pending = []
-                        break
-                    job.detail = (
-                        f"Telegram flood wait {wait}s — retrying in {FLOOD['cap']:.0f}s "
-                        f"({job.ok}/{len(requests)} done)"
-                    )
-                    self.emit("job", job=job.as_dict())
-                    await asyncio.sleep(FLOOD["cap"] + 0.5)
+                    for k in pending:
+                        results[start + k] = ("err", exc)
+                        job.fail += 1
+                        job.errors.append({"user_id": ids[k], "error": f"flood_wait:{wait}"})
+                    pending = []
                 except Exception as exc:
                     self.note("warn", f"Container failed ({_err_name(exc)}); retrying peers one by one.")
                     for k in pending:
@@ -861,15 +808,14 @@ class HydraEngine:
                             results[start + k] = ("ok", item)
                             job.ok += 1
                         except FloodWaitError as fw:
-                            await asyncio.sleep(FLOOD["cap"] + 0.5)
-                            try:
-                                item = await client(chunk[k])
-                                results[start + k] = ("ok", item)
-                                job.ok += 1
-                            except Exception as exc2:
-                                results[start + k] = ("err", exc2)
-                                job.fail += 1
-                                job.errors.append({"user_id": ids[k], "error": _err_name(exc2)})
+                            results[start + k] = ("err", fw)
+                            job.fail += 1
+                            job.errors.append(
+                                {
+                                    "user_id": ids[k],
+                                    "error": f"flood_wait:{int(getattr(fw, 'seconds', 1) or 1)}",
+                                }
+                            )
                         except Exception as exc2:
                             results[start + k] = ("err", exc2)
                             job.fail += 1
@@ -1447,7 +1393,6 @@ class EnginePool:
 
     async def bootstrap(self) -> None:
         """Restore every stored session at boot (legacy data becomes 'main')."""
-        FLOOD["cap"] = float(await store.get("flood_cap") or 3)
         meta = await store.get("pool") or {}
         keys = list(meta.get("keys") or [])
         main = HydraEngine("main")
