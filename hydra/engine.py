@@ -53,13 +53,13 @@ DATA = ROOT / "data"
 CREDS_PATH = DATA / "creds.json"
 SESSION_PATH = DATA / "session.string"
 
-# MTProto containers stay reliable around this size even with medium-length copy.
-BURST = 48
-# Pacing between MTProto containers. Drafts are cheap; keep this snappy but
-# not so fast that Telegram flood-waits every container.
+# DMs / fires / broadcasts go out this many at a time.
+BURST = 500
+# Pacing between batches. Drafts are cheap; keep this snappy but
+# not so fast that Telegram flood-waits every batch.
 BURST_PACE = 0.35
-# Draft writing is much cheaper for Telegram than sending — run it wider.
-ARM_BURST = 64
+# Draft writing uses the same batch size as sends.
+ARM_BURST = 500
 ARM_PACE = 0.15
 # Flood policy: NO waiting. When Telegram demands a flood wait the item is
 # instantly marked flood_wait (retryable later) and the job moves on. Rapid
@@ -1705,6 +1705,11 @@ class _EngineProxy:
 
     def __setattr__(self, name: str, value: Any) -> None:
         setattr(pool.active(), name, value)
+
+
+pool = EnginePool()
+engine = _EngineProxy()
+tattr(pool.active(), name, value)
 
 
 pool = EnginePool()
