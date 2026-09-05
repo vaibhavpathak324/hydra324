@@ -166,6 +166,9 @@ class HydraEngine:
         self._listeners: set[asyncio.Queue] = set()
         self._lock = asyncio.Lock()
         self._job_lock = asyncio.Lock()
+        # Chat list cache: Reload cooldown + stale fallback on Telegram floods.
+        self._chats_cache: Optional[list[dict[str, Any]]] = None
+        self._chats_ts: float = 0.0
 
     def _k(self, name: str) -> str:
         return name if self.skey == "main" else f"{self.skey}:{name}"
@@ -596,8 +599,33 @@ class HydraEngine:
     # ── chats & join requests ───────────────────────────────
     async def list_chats(self) -> list[dict[str, Any]]:
         client = self._need()
+        # Cooldown: repeated Reload taps must not hammer Telegram (each load
+        # is several GetDialogs requests) — serve the recent list instantly.
+        if self._chats_cache is not None and time.time() - self._chats_ts < 15:
+            return self._chats_cache
+        try:
+            out = await self._fetch_chats(client)
+        except FloodWaitError as exc:
+            wait = int(getattr(exc, "seconds", 20) or 20)
+            if self._chats_cache is not None:
+                self.note(
+                    "warn",
+                    f"Telegram limited the chat reload ({wait}s) — showing the saved list.",
+                )
+                return self._chats_cache
+            raise RuntimeError(
+                f"Telegram asks to wait ~{wait}s before loading chats. "
+                "Try again shortly — this eases off on its own."
+            ) from exc
+        self._chats_cache = out
+        self._chats_ts = time.time()
+        return out
+
+    async def _fetch_chats(self, client: TelegramClient) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        async for dialog in client.iter_dialogs():
+        # Bounded depth: unbounded iteration made each Reload fire one request
+        # per 100 dialogs, which is what kept re-triggering GetDialogs floods.
+        async for dialog in client.iter_dialogs(limit=500):
             entity = dialog.entity
             if isinstance(entity, User):
                 continue
