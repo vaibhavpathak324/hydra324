@@ -21,6 +21,24 @@ log = logging.getLogger("hydra.server")
 WEB = Path(__file__).resolve().parent.parent / "web"
 
 
+async def _keepalive() -> None:
+    """Free-tier keep-alive: ping this service's public URL every 10 min so
+    Render never spins it down (a control bot must answer instantly)."""
+    url = (os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+    if not url:
+        return
+    import urllib.request
+
+    while True:
+        await asyncio.sleep(600)
+        try:
+            await asyncio.to_thread(
+                urllib.request.urlopen, url + "/api/status", timeout=30
+            )
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     DATA.mkdir(parents=True, exist_ok=True)
@@ -29,6 +47,7 @@ async def lifespan(app: FastAPI):
     for eng in list(pool.engines.values()):
         eng.start_background()
     pool._heal_task = asyncio.create_task(pool.self_heal(), name="hydra-self-heal")
+    pool._ka_task = asyncio.create_task(_keepalive(), name="hydra-keepalive")
     try:
         await controller.start()
     except Exception as exc:
@@ -42,6 +61,8 @@ async def lifespan(app: FastAPI):
     await pool.release_all()
     if getattr(pool, "_heal_task", None):
         pool._heal_task.cancel()
+    if getattr(pool, "_ka_task", None):
+        pool._ka_task.cancel()
     for eng in pool.engines.values():
         if eng.client:
             try:
