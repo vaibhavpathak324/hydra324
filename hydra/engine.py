@@ -510,6 +510,11 @@ class HydraEngine:
         a = self.auto or {}
         if not a.get("on") or self.phase != "ready":
             return
+        # Safety rest: when Telegram flags the account (peer_flood) and a
+        # pass achieved literally nothing, wait out the flag instead of
+        # hammering — hammering can escalate it. Visible in the notes.
+        if time.time() < getattr(self, "_pf_until", 0):
+            return
         # A job left "running" by a crash used to block every future pass —
         # recover instead: if it went quiet minutes ago, close it and go on.
         j = self.job
@@ -537,6 +542,19 @@ class HydraEngine:
             ok = int(jinfo.get("ok") or 0)
             sent_total += ok
             last = f"+{ok} sent · {int(jinfo.get('fail') or 0)} failed"
+            pf = sum(
+                1
+                for e in (jinfo.get("errors") or [])
+                if str((e or {}).get("error", "")).startswith("peer_flood")
+            )
+            if ok == 0 and pf >= 5:
+                self._pf_until = time.time() + 90
+                self.note(
+                    "warn",
+                    "Telegram flagged this account (peer flood) — resting 90s, "
+                    "then continuing automatically. The flag eases off faster "
+                    "when we pause the storm.",
+                )
         except Exception as exc:
             if "No one left" in str(exc):
                 self.auto = {**a, "on": False}

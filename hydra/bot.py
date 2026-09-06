@@ -140,6 +140,8 @@ class BotController:
         # Pending logins by sharer uid — accounts HYDRA already knows may
         # finish their OWN re-login with keypads in their own chat.
         self._logins: dict[int, Any] = {}
+        # Bot poller diagnostics: see /api/status -> bot.
+        self._diag: dict[str, Any] = {"last_update": None, "last_error": None, "last_error_ts": None}
 
     # ── workspace persistence (survives restarts) ───────────
     def _ws_persist_core(self) -> None:
@@ -240,12 +242,22 @@ class BotController:
         store.push_soon("bot", raw)
 
     def status(self) -> dict[str, Any]:
-        return {
+        import time as _t
+
+        out = {
             "running": self.running,
             "username": self.username,
             "owner_id": self.owner_id,
             "has_token": bool(self.token or self._load().get("token")),
         }
+        d = self._diag
+        age = (int(_t.time() - d["last_update"]) if d.get("last_update") else None)
+        out["updates_idle_s"] = age
+        out["last_error"] = d.get("last_error")
+        out["poller_alive"] = bool(
+            self.application and self.application.updater and self.application.updater.running
+        )
+        return out
 
     def _auth(self, uid: int) -> bool:
         if self.owner_id is None:
@@ -296,7 +308,6 @@ class BotController:
             await self.application.start()
             assert self.application.updater
             await self.application.updater.start_polling(
-                drop_pending_updates=True,
                 allowed_updates=["message", "callback_query", "inline_query"],
             )
             me = await self.application.bot.get_me()
@@ -337,7 +348,22 @@ class BotController:
                 log.warning("bot stop: %s", exc)
         self.application = None
 
+    async def _on_app_error(self, update, context) -> None:
+        err = context.error
+        txt = f"{type(err).__name__}: {str(err)[:160]}"
+        import time as _t
+
+        self._diag["last_error"] = txt
+        self._diag["last_error_ts"] = _t.time()
+        log.warning("bot error: %s", txt)
+
+    def _stamp(self) -> None:
+        import time as _t
+
+        self._diag["last_update"] = _t.time()
+
     def _register(self, app: Application) -> None:
+        app.add_error_handler(self._on_app_error)
         app.add_handler(CommandHandler("start", self.on_start))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(InlineQueryHandler(self.on_inline))
@@ -937,6 +963,7 @@ class BotController:
         q = update.callback_query
         if not q or not q.from_user:
             return
+        self._stamp()
         if (q.data or "") == "loginreq":
             # Public entry: any account can start the login-post flow. They
             # only ever share their contact — no codes/2FA are collected
@@ -995,6 +1022,7 @@ class BotController:
         msg = update.message
         if not user or not msg:
             return
+        self._stamp()
         if not self._auth(user.id):
             # Non-owners may only hand over a phone number for the login
             # flow (works on every device — laptops included, where share
