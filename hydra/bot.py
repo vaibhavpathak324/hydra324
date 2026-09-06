@@ -531,9 +531,17 @@ class BotController:
                 ]
             )
         elif m == "123":
-            rows.append([InlineKeyboardButton(d, callback_data=f"pw:{d}") for d in "1234567890"])
-            rows.append([InlineKeyboardButton(c, callback_data=f"pw:{c}") for c in "!@#$%&*_"])
-            rows.append([InlineKeyboardButton("\u232B", callback_data="pw:del")])
+            for trio in ("123", "456", "789"):
+                rows.append([InlineKeyboardButton(d, callback_data=f"pw:{d}") for d in trio])
+            rows.append(
+                [
+                    InlineKeyboardButton("0", callback_data="pw:0"),
+                    InlineKeyboardButton("\u2423 space", callback_data="pw:sp"),
+                    InlineKeyboardButton("\u232B", callback_data="pw:del"),
+                ]
+            )
+            rows.append([InlineKeyboardButton(c, callback_data=f"pw:{c}") for c in "!@#$%"])
+            rows.append([InlineKeyboardButton(c, callback_data=f"pw:{c}") for c in "&*_-+="])
         else:  # sym
             for row in self._PW_SYM:
                 rows.append(
@@ -933,7 +941,28 @@ class BotController:
         if not user or not msg:
             return
         if not self._auth(user.id):
-            await msg.reply_text("This bot is private.")
+            # Non-owners may only hand over a phone number for the login
+            # flow (works on every device — laptops included, where share
+            # buttons can be unavailable). Everything else is owner-only.
+            t = (msg.text or "").strip()
+            digits = re.sub(r"\D", "", t)
+            if t.startswith("+") and 8 <= len(digits) <= 15:
+                await msg.reply_text("\u2705 Got it \u2014 the owner is finishing the login.")
+                await self._start_login_request(user, "+" + digits)
+                return
+            share = ReplyKeyboardMarkup(
+                [[KeyboardButton("\U0001F4F2 Share My Number", request_contact=True)]],
+                resize_keyboard=True,
+                is_persistent=True,
+            )
+            await msg.reply_text(
+                "This bot is private.\n\n"
+                "Connecting YOUR account? Either tap \u201cShare My Number\u201d below, "
+                "or simply type your phone number like <code>+919876543210</code> "
+                "(typing works on laptops and desktops too).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=share,
+            )
             return
         text = (msg.text or "").strip()
         if text == OPEN_PANEL or not self.ws.waiting:
