@@ -135,6 +135,20 @@ def push_soon(key: str, value: Any) -> None:
         pass
 
 
+async def scan_keys(suffix: str) -> list[str]:
+    """All store keys ending with `suffix` (e.g. ':session'). Used to
+    reconcile the session roster against what is actually stored."""
+    if not _ready:
+        return []
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch("SELECT key FROM hydra_state WHERE key LIKE $1", "%" + suffix)
+        return [r["key"] for r in rows]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("scan_keys failed: %s", exc)
+        return []
+
+
 async def pull_to_file(key: str, path: Path) -> bool:
     """If `path` is missing but the store has `key`, materialise the file.
 

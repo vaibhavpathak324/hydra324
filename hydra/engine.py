@@ -1761,6 +1761,7 @@ class EnginePool:
                                 e.note("ok", "Connection re-established by watchdog.")
                             except Exception:
                                 pass
+                    await self._resurrect_missing()
                     continue
                 if not await self._has_stored_sessions():
                     continue  # user genuinely has no session yet
@@ -1776,13 +1777,15 @@ class EnginePool:
                 pass
 
     async def _stored(self, eng: "HydraEngine") -> bool:
-        """True when a session exists on disk or in the state store."""
+        """True when a session exists on disk or in the state store. On a
+        store error, fail VISIBLE (True) — dropping a stored session from
+        the roster is the worse failure by far."""
         if eng.session_path.exists() and eng.creds_path.exists():
             return True
         try:
             return bool(await store.get(eng._k("session")))
         except Exception:
-            return False
+            return True
 
     def _spawn_resume(self, key: str, eng: "HydraEngine") -> None:
         """Background reconnect for a session that could not resume at boot —
@@ -1819,6 +1822,25 @@ class EnginePool:
         except RuntimeError:
             pass
 
+    async def _resurrect_missing(self) -> None:
+        """Roster reconciliation: any stored session that is not currently
+        registered gets re-registered as 'reconnecting' with a background
+        resume — stored sessions can never stay invisible."""
+        try:
+            raw = await store.scan_keys(":session")
+        except Exception:
+            return
+        for rk in raw:
+            k = rk[: -len(":session")]
+            if not k.startswith(("s", "main")) or k in self.engines:
+                continue
+            e = HydraEngine(k)
+            self._register(k, e, make_active=False)
+            e.phase = "waiting"
+            e.note("ok", "Session restored to the roster — reconnecting.")
+            self._spawn_resume(k, e)
+            self.persist_meta()
+
     async def bootstrap(self) -> None:
         """Restore every stored session at boot (legacy data becomes 'main').
 
@@ -1830,20 +1852,33 @@ class EnginePool:
         """
         meta = await store.get("pool") or {}
         keys = list(meta.get("keys") or [])
+        # The roster meta is a cache, not the truth: union it with every
+        # real stored session so a corrupted/stale meta can never hide a
+        # stored session.
+        try:
+            for rk in await store.scan_keys(":session"):
+                rk = rk[: -len(":session")]
+                if rk.startswith(("s", "main")) and rk not in keys:
+                    keys.append(rk)
+        except Exception:
+            pass
         for k in ["main"] + [x for x in keys if x != "main"]:
-            e = HydraEngine(k)
-            if await self._claim_lock(k, timeout=20.0):
-                try:
-                    await e.try_resume()
-                except Exception:
-                    pass
-                if e.phase != "ready":
-                    await self._release_lock(k)
-            if e.phase == "ready" or await self._stored(e):
-                self._register(k, e, make_active=(meta.get("active") == k))
-                if e.phase not in ("ready", "dead_key"):
-                    e.phase = "waiting"
-                    self._spawn_resume(k, e)
+            try:
+                e = HydraEngine(k)
+                if await self._claim_lock(k, timeout=20.0):
+                    try:
+                        await e.try_resume()
+                    except Exception:
+                        pass
+                    if e.phase != "ready":
+                        await self._release_lock(k)
+                if e.phase == "ready" or await self._stored(e):
+                    self._register(k, e, make_active=(meta.get("active") == k))
+                    if e.phase not in ("ready", "dead_key"):
+                        e.phase = "waiting"
+                        self._spawn_resume(k, e)
+            except Exception:
+                continue  # one broken session must never abort the others
         if self.active_key is None and self.order:
             self.active_key = self.order[0]
             self.persist_meta()
