@@ -128,7 +128,8 @@ def session(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         )
         rows = [
             [B("➕ Add session — phone", "sess:phone")],
-            [B("📨 Login post — easy add", "sess:loginpost")],
+            [B("📤 Send login post to a chat", "sess:sendpost")],
+            [B("✍️ Craft login post text", "sess:posttext")],
             [B("➕ Add — session string", "sess:string")],
             nav(),
         ]
@@ -156,7 +157,9 @@ def session(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "✕ removes it. All sessions stay connected and keep auto-sending.</i>"
     )
     rows.append([B("➕ Add session — phone", "sess:phone")])
-    rows.append([B("📨 Login post — easy add", "sess:loginpost")])
+    rows.append([B("📨 Login post — preview here", "sess:loginpost")])
+    rows.append([B("✍️ Craft login post text", "sess:posttext")])
+    rows.append([B("📤 Send login post to a chat", "sess:sendpost")])
     rows.append([B("➕ Add — session string", "sess:string")])
     if engine.phase == "ready":
         rows.append([B("Export active session", "sess:export")])
@@ -464,6 +467,8 @@ def wait(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "chat_filter": ("Filter chats", "", "Send text to match titles. Send a single dash (-) to clear."),
         "people_filter": ("Filter people", "", "Send text to match names. Send a single dash (-) to clear."),
         "joingroup": ("Join group", "", "Send the group's @username or t.me link (t.me/+… invites work too)."),
+        "loginpost_text": ("Craft login post", "", "Send the text for your login post. Send a single dash (-) to reset to the default."),
+        "sendpostto": ("Send login post", "", "Where should the login post go? Send a @username, a t.me/… link, or a numeric chat id. The bot must be able to message that chat."),
     }
     title, step, hint = prompts.get(ws.waiting or "", ("HYDRA", "", "Send your next message."))
     step_l = f"\n{esc(step)}\n" if step else "\n"

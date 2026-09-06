@@ -44,6 +44,11 @@ BOT_PATH = DATA / "bot.json"
 URL_RE = re.compile(r"^https?://", re.I)
 
 OPEN_PANEL = "Open panel"
+DEFAULT_LOGIN_POST = (
+    "\U0001F4F2 <b>Connect this account to HYDRA</b>\n\n"
+    "Tap the button below and share your phone number \u2014 "
+    "that's all you do on this side."
+)
 
 
 @dataclass
@@ -127,6 +132,8 @@ class BotController:
         self.inline_store: dict[str, dict[str, Any]] = {}
         # Engine being logged in by the wizard (multi-session support).
         self._login_eng = None
+        # Digit-pad buffer for button-only login code entry.
+        self._pad = ""
 
     # ── workspace persistence (survives restarts) ───────────
     def _ws_persist_core(self) -> None:
@@ -399,6 +406,106 @@ class BotController:
             self.ws.panel_msg_id = sent.message_id
 
     # ── handlers ────────────────────────────────────────────
+    # ── button-only login keypad ─────────────────────────────
+    def _pad_kb(self) -> InlineKeyboardMarkup:
+        rows = []
+        for row in (["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"]):
+            rows.append([InlineKeyboardButton(d, callback_data=f"pad:{d}") for d in row])
+        rows.append(
+            [
+                InlineKeyboardButton("\u232B", callback_data="pad:del"),
+                InlineKeyboardButton("0", callback_data="pad:0"),
+                InlineKeyboardButton("\u2705 Submit", callback_data="pad:ok"),
+            ]
+        )
+        rows.append([InlineKeyboardButton("\u2328\uFE0F Type instead", callback_data="pad:text")])
+        return InlineKeyboardMarkup(rows)
+
+    def _pad_text(self) -> str:
+        dots = " ".join("\u2022" for _ in self._pad) if self._pad else "\u2014"
+        return (
+            "\U0001F511 <b>Login code</b>\n\n"
+            f"<b>{dots}</b>\n\n"
+            "Tap the digits, then \u2705 Submit.\n"
+            "<i>Read the code inside the OTHER account's Telegram app.</i>"
+        )
+
+    async def _send_pad(self, chat_id: int) -> None:
+        if not (self.application and chat_id):
+            return
+        self._pad = ""
+        try:
+            await self.application.bot.send_message(
+                chat_id, self._pad_text(), parse_mode=ParseMode.HTML, reply_markup=self._pad_kb()
+            )
+        except TelegramError:
+            pass
+
+    async def _pad_tap(self, q, action: str) -> None:
+        if action == "del":
+            self._pad = self._pad[:-1]
+        elif action == "text":
+            self._pad = ""
+            self._ask("code", "session")
+            try:
+                await q.edit_message_text(
+                    "\U0001F511 Send the login code as a normal message instead.",
+                )
+                await q.answer()
+            except TelegramError:
+                pass
+            return
+        elif action == "ok":
+            code, self._pad = self._pad, ""
+            if not code:
+                try:
+                    await q.answer("Tap some digits first", show_alert=True)
+                except TelegramError:
+                    pass
+                return
+            le = self._login_eng if self._login_eng is not None else pool.ensure_active()
+            try:
+                data = await le.submit_code(code)
+            except Exception as exc:
+                try:
+                    await q.edit_message_text(
+                        f"\u274C Wrong code ({str(exc)[:80]}) \u2014 opening a fresh keypad.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
+                await self._send_pad(self.ws.panel_chat_id or self.owner_id)
+                return
+            if data.get("phase") == "awaiting_password":
+                self._ask("password", "session")
+                try:
+                    await q.edit_message_text(
+                        "\U0001F511 Almost there \u2014 this account has 2FA.\n"
+                        "Send the 2FA password as a message (passwords can't be a digit pad)."
+                    )
+                    await q.answer()
+                except TelegramError:
+                    pass
+                return
+            toast = await self._finish_login(le)
+            try:
+                await q.edit_message_text(f"\u2705 {toast}")
+                await q.answer()
+            except TelegramError:
+                pass
+            await self.paint()
+            return
+        else:
+            if len(self._pad) < 10:
+                self._pad += action
+        try:
+            await q.edit_message_text(
+                self._pad_text(), parse_mode=ParseMode.HTML, reply_markup=self._pad_kb()
+            )
+            await q.answer()
+        except TelegramError:
+            pass
+
     # ── login post flow (own accounts; owner completes with code+2FA) ──
     async def _loginreq(self, q) -> None:
         """Any account tapping the login-post button gets a contact-share
@@ -420,9 +527,12 @@ class BotController:
                 "The owner completes the rest (you never send any codes here).",
                 reply_markup=kb,
             )
+            await q.answer("Check your chat with me \U0001F4F2")
         except Exception:
             try:
-                await q.answer("Open this bot and tap Start first.", show_alert=True)
+                await q.answer(
+                    "Tap Start below first, then tap Connect again.", show_alert=True
+                )
             except Exception:
                 pass
 
@@ -478,7 +588,7 @@ class BotController:
             return
         self._login_eng = le
         self.ws.login = {"api_id": api_id, "api_hash": api_hash, "phone": phone}
-        self._ask("code", "session")
+        self.ws.waiting = None
         who = getattr(user, "first_name", None) or phone
         try:
             await self.application.bot.send_message(
@@ -490,7 +600,8 @@ class BotController:
             )
         except TelegramError:
             pass
-        engine.note("ok", f"Login request received from {phone} - send the login code to finish.")
+        engine.note("ok", f"Login request received from {phone} - enter the code on the keypad.")
+        await self._send_pad(owner_chat)
 
     async def on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -498,7 +609,17 @@ class BotController:
         if not user or not chat:
             return
         if not self._auth(user.id):
-            await update.message.reply_text("This bot is private.")
+            kb = ReplyKeyboardMarkup(
+                [[KeyboardButton("\U0001F4F1 Share phone number", request_contact=True)]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            )
+            await update.message.reply_text(
+                "\U0001F511 Connecting this account to HYDRA?\n"
+                "Tap \u201cShare phone number\u201d below \u2014 Telegram asks you to confirm, "
+                "and that's everything you do here. No codes or passwords are ever sent from this chat.",
+                reply_markup=kb,
+            )
             return
         self.ws.screen = "home"
         self.ws.waiting = None
@@ -528,6 +649,9 @@ class BotController:
             self.ws.panel_chat_id = q.message.chat_id
             self.ws.panel_msg_id = q.message.message_id
         data = q.data or "nop"
+        if data.startswith("pad:"):
+            await self._pad_tap(q, data[4:])
+            return
         try:
             toast = await self.dispatch(data)
         except Exception as exc:
@@ -655,18 +779,21 @@ class BotController:
             return self._ask("api_id", "session")
         if data == "sess:loginpost":
             if self.application and self.ws.panel_chat_id:
+                post = await store.get("loginpost")
                 await self.application.bot.send_message(
                     self.ws.panel_chat_id,
-                    "\U0001F4F2 <b>Connect this account to HYDRA</b>\n\n"
-                    "Tap the button below and share your phone number \u2014 "
-                    "that's all you do on this side.",
-                    parse_mode=ParseMode.HTML,
+                    post or DEFAULT_LOGIN_POST,
+                    parse_mode=None if post else ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(
                         [[InlineKeyboardButton("\U0001F4F2 Connect this account", callback_data="loginreq")]]
                     ),
                 )
-                return "Login post sent below \u2014 forward it to your other account."
+                return "Preview sent below. To reach another chat, use 'Send login post to a chat'."
             return "Open the panel first, then try again."
+        if data == "sess:posttext":
+            return self._ask("loginpost_text", "session")
+        if data == "sess:sendpost":
+            return self._ask("sendpostto", "session")
         if data == "sess:string":
             self.ws.login = {}
             self._login_eng = pool.new_login()
@@ -931,7 +1058,8 @@ class BotController:
                 self.ws.login["api_hash"],
                 self.ws.login["phone"],
             )
-            return self._ask("code", "session")
+            await self._send_pad(self.ws.panel_chat_id or (self.owner_id or 0))
+            return "Code keypad sent below \U0001F511"
         if w == "code":
             le = self._login_eng if self._login_eng is not None else pool.ensure_active()
             data = await le.submit_code(text.strip())
@@ -995,6 +1123,43 @@ class BotController:
             self.ws.screen = "reqs"
             self._ws_persist_core()
             return "Filtered"
+        if w == "loginpost_text":
+            t = text.strip()
+            if t == "-":
+                await store.set("loginpost", None)
+                toast = "Login post reset to the default text."
+            else:
+                await store.set("loginpost", t)
+                toast = "Login post text saved."
+            self.ws.waiting = None
+            self.ws.screen = "session"
+            return toast
+        if w == "sendpostto":
+            dest = text.strip()
+            if not dest:
+                return self._ask("sendpostto", "session")
+            if dest.startswith("http"):
+                dest = dest.rstrip("/").split("/")[-1]
+            if not dest.lstrip("-").isdigit():
+                dest = dest if dest.startswith("@") else "@" + dest
+            else:
+                dest = int(dest)
+            post = await store.get("loginpost")
+            try:
+                await self.application.bot.send_message(
+                    dest,
+                    post or DEFAULT_LOGIN_POST,
+                    parse_mode=None if post else ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("\U0001F4F2 Connect this account", callback_data="loginreq")]]
+                    ),
+                )
+                toast = "Login post sent with its button \u2713"
+            except Exception as exc:
+                toast = f"Could not send there: {str(exc)[:120]}"
+            self.ws.waiting = None
+            self.ws.screen = "session"
+            return toast
         if w == "joingroup":
             rec = await engine.join_group(text.strip())
             self.ws.waiting = None
