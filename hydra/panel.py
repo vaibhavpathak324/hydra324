@@ -384,9 +384,10 @@ def postedit(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         f"<b>Image:</b> {'✅ set' if cfg.get('photo') else '— none (text-only post)'}",
         f"<b>Button:</b> {esc(str(button))}  <i>(triggers share-contact → you finish the login)</i>",
         "",
-        "<i>Preview shows exactly what other accounts receive. The button is always "
-        "attached automatically — forwarded copies lose buttons, so deliver via "
-        "'Send to a chat'.</i>",
+        "<i>Delivered to a DM, the post carries your button as a native share-contact "
+        "button — tapping it pops Telegram's own \u201cShare phone number?\u201d confirmation. "
+        "In groups it becomes an inline Connect button. Forwarded copies lose "
+        "buttons, so always deliver via 'Send to a chat'.</i>",
     ]
     rows = [
         [B("📝 Set text", "post:txt"), B("🖼 Set image", "post:pic")],
