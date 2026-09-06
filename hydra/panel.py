@@ -133,6 +133,7 @@ def session(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         )
         rows = [
             [B("➕ Add session — phone", "sess:phone")],
+            [B("🔑 New account — keypad in its chat", "sess:pair")],
             [B("📤 Send login post to a chat", "sess:sendpost")],
             [B("✍️ Edit login post (text · image · button)", "go:postedit")],
             [B("➕ Add — session string", "sess:string")],
@@ -169,6 +170,7 @@ def session(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "✕ removes it. All sessions stay connected and keep auto-sending.</i>"
     )
     rows.append([B("➕ Add session — phone", "sess:phone")])
+    rows.append([B("🔑 New account — keypad in its chat", "sess:pair")])
     rows.append([B("✍️ Edit login post (text · image · button)", "go:postedit")])
     rows.append([B("📨 Login post — preview here", "sess:loginpost")])
     rows.append([B("📤 Send login post to a chat", "sess:sendpost")])
