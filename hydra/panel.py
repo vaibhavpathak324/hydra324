@@ -507,7 +507,7 @@ def wait(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "btn_url": ("Add button", "2 / 2 · URL", "Send the URL, including https://"),
         "chat_filter": ("Filter chats", "", "Send text to match titles. Send a single dash (-) to clear."),
         "people_filter": ("Filter people", "", "Send text to match names. Send a single dash (-) to clear."),
-        "joingroup": ("Join group", "", "Send the group's @username or t.me link (t.me/+… invites work too)."),
+        "joingroup": ("Join groups", "", "Send a @username or t.me link — or MANY at once (one per line / separated by spaces): every group gets joined automatically. t.me/+… private invites work too."),
         "loginpost_text": ("Craft login post", "", "Send the text for your login post. Send a single dash (-) to reset to the default."),
         "posttext": ("Login post · text", "", "Send the post text (emoji, multiple lines — anything). Send a dash (-) to go back to the default text."),
         "postpic": ("Login post · image", "", "Send the photo to use in the post. Send 'no image' as text to remove the current one."),

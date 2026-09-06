@@ -580,6 +580,54 @@ class HydraEngine:
             await self._auto_tick(force=True)
 
     # ── group joining + group broadcast ──────────────────────
+    async def join_groups(self, identifiers: list[str]) -> dict[str, Any]:
+        """Join many groups/channels in one go (flood-tolerant): each item is
+        attempted, failures are collected, joins are saved as they happen."""
+        identifiers = [i.strip() for i in identifiers if i.strip()]
+        if not identifiers:
+            raise RuntimeError("Send at least one @username or t.me link.")
+        ok, failed = [], []
+        for ident in identifiers:
+            try:
+                rec = await self.join_group(ident)
+                ok.append(rec.get("title") or ident)
+            except Exception as exc:
+                low = str(exc).lower()
+                if "flood" in low:
+                    failed.append(f"{ident} (Telegram says wait — retry in a minute)")
+                elif "already" in low:
+                    # Already a member. Username-style links can be resolved
+                    # and listed; invite hashes cannot (no entity to fetch).
+                    clean = ident.split("/")[-1].lstrip("@")
+                    resolvable = clean and not clean.startswith("+") and "joinchat" not in ident and "+" not in ident
+                    added = False
+                    if resolvable:
+                        try:
+                            entity = await (self._need()).get_entity(clean)
+                            rec = {
+                                "id": int(entity.id),
+                                "title": getattr(entity, "title", None) or ident,
+                                "username": getattr(entity, "username", None),
+                                "access_hash": str(int(getattr(entity, "access_hash", 0) or 0)),
+                            }
+                            joins = [j for j in self.joins if j["id"] != rec["id"]]
+                            joins.append(rec)
+                            self.joins = joins
+                            store.push_soon(self._k("joins"), self.joins)
+                            ok.append(f"{rec['title']} (already a member — added to the list)")
+                            added = True
+                        except Exception:
+                            pass
+                    if not added:
+                        failed.append(f"{ident} (already a member — send its @username to list it)")
+                elif "invite" in low and ("hash" in low or "expired" in low):
+                    failed.append(f"{ident} (invite invalid or expired)")
+                elif "private" in low or "not found" in low or "username" in low:
+                    failed.append(f"{ident} (not found or private — needs an invite link)")
+                else:
+                    failed.append(f"{ident} ({str(exc)[:60]})")
+        return {"joined": ok, "failed": failed, "total_joined": len(self.joins)}
+
     async def join_group(self, identifier: str) -> dict[str, Any]:
         """Join a public group/channel by @username or t.me link, or a private
         one by invite link (t.me/+hash). remembers it for group broadcasts."""
