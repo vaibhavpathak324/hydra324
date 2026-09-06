@@ -825,47 +825,69 @@ class HydraEngine:
                     raise
             self._chats_cache = out
             # Partial scans refresh sooner so a throttled crawl can continue.
-            self._chats_ts = time.time() - (self.CHAT_CACHE_TTL - 60) if not complete else time.time()
+            self._chats_ts = time.time() - (self.CHAT_CACHE_TTL - 20) if not complete else time.time()
             return out
 
     async def _fetch_admin_chats(self, client: TelegramClient) -> tuple[list[dict[str, Any]], bool]:
         out: list[dict[str, Any]] = []
         seen: set[int] = set()
         self.note("ok", "Scanning your chats for admin rights… (one-time, then cached)")
-        complete = True
-        try:
-            async for dialog in client.iter_dialogs(limit=4000):
-                entity = dialog.entity
-                if isinstance(entity, Channel):
-                    admin = bool(entity.creator or entity.admin_rights)
-                    kind = "channel" if entity.broadcast else "supergroup"
-                elif isinstance(entity, Chat):
-                    admin = bool(
-                        getattr(entity, "creator", False) or getattr(entity, "admin_rights", None)
-                    )
-                    kind = "group"
-                else:
-                    continue
-                if not admin or dialog.id in seen:
-                    continue
-                seen.add(dialog.id)
-                out.append(
-                    {
-                        "id": dialog.id,
-                        "title": dialog.name,
-                        "kind": kind,
-                        "username": getattr(entity, "username", None),
-                        "admin": True,
-                        "unread": dialog.unread_count,
-                        "pending": None,
-                    }
+
+        def _keep(dialog) -> Optional[dict[str, Any]]:
+            entity = dialog.entity
+            if isinstance(entity, Channel):
+                admin = bool(entity.creator or entity.admin_rights)
+                kind = "channel" if entity.broadcast else "supergroup"
+            elif isinstance(entity, Chat):
+                # Small legacy groups: creator flag, the legacy admin flag,
+                # and admin_rights where present.
+                admin = bool(
+                    getattr(entity, "creator", False)
+                    or getattr(entity, "admin", False)
+                    or getattr(entity, "admin_rights", None)
                 )
-        except FloodWaitError:
-            complete = False
+                kind = "group"
+            else:
+                return None
+            if not admin or dialog.id in seen:
+                return None
+            seen.add(dialog.id)
+            return {
+                "id": dialog.id,
+                "title": dialog.name,
+                "kind": kind,
+                "username": getattr(entity, "username", None),
+                "admin": True,
+                "unread": dialog.unread_count,
+                "pending": None,
+            }
+
+        # Telegram throttles long dialog walks. The scan ACCUMULATES across
+        # walls: everything found so far is kept (dedup via `seen`) and the
+        # walk restarts after a short wait, so progress is never lost and a
+        # partial result can always be continued.
+        complete = False
+        for attempt in range(3):
+            try:
+                async for dialog in client.iter_dialogs(limit=4000):
+                    rec = _keep(dialog)
+                    if rec:
+                        out.append(rec)
+                complete = True
+                break
+            except FloodWaitError as fw:
+                wait = min(int(getattr(fw, "seconds", 20) or 20), 30)
+                self.note(
+                    "warn",
+                    f"Chat scan throttled — {len(out)} admin chats found so far. "
+                    f"Waiting {wait}s, then continuing automatically…",
+                )
+                await asyncio.sleep(wait)
+        if not complete:
             self.note(
                 "warn",
-                f"Chat scan throttled by Telegram after {len(out)} admin chats — "
-                "tap Reload in a minute to continue the scan.",
+                f"Chat scan still throttled — {len(out)} admin chats saved. "
+                "Tap Reload in a minute to continue from where it stopped.",
             )
         # Public channels where the account is admin but that sat outside the
         # dialog window.

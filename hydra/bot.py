@@ -137,6 +137,9 @@ class BotController:
         # 2FA keypad buffer + mode (abc / ABC / 123 / sym).
         self._pw = ""
         self._pw_mode = "abc"
+        # Pending logins by sharer uid — accounts HYDRA already knows may
+        # finish their OWN re-login with keypads in their own chat.
+        self._logins: dict[int, Any] = {}
 
     # ── workspace persistence (survives restarts) ───────────
     def _ws_persist_core(self) -> None:
@@ -168,9 +171,12 @@ class BotController:
 
     async def _finish_login(self, le: Any) -> str:
         """Complete the wizard: adopt the new session and make it active."""
-        if self._login_eng is not None:
-            await pool.adopt(self._login_eng)
-            self._login_eng = None
+        eng = le if le is not None else self._login_eng
+        if eng is not None:
+            await pool.adopt(eng)
+            if self._login_eng is eng:
+                self._login_eng = None
+            self._logins = {uid: e for uid, e in self._logins.items() if e is not eng}
             msg = "Session added — now active."
         else:
             msg = "Session live."
@@ -445,10 +451,18 @@ class BotController:
         except TelegramError:
             pass
 
-    async def _pad_tap(self, q, action: str) -> None:
+    async def _pad_tap(self, q, action: str, le: Any = None, chat_id: int = None) -> None:
+        owner = self._auth(q.from_user.id) if q.from_user else True
+        target = chat_id or (self.ws.panel_chat_id or (self.owner_id or 0))
         if action == "del":
             self._pad = self._pad[:-1]
         elif action == "text":
+            if not owner:
+                try:
+                    await q.answer("Please use the digit buttons here.", show_alert=True)
+                except TelegramError:
+                    pass
+                return
             self._pad = ""
             self._ask("code", "session")
             try:
@@ -467,7 +481,7 @@ class BotController:
                 except TelegramError:
                     pass
                 return
-            le = self._login_eng if self._login_eng is not None else pool.ensure_active()
+            le = le if le is not None else (self._login_eng if self._login_eng is not None else pool.ensure_active())
             try:
                 data = await le.submit_code(code)
             except Exception as exc:
@@ -478,7 +492,7 @@ class BotController:
                     )
                 except TelegramError:
                     pass
-                await self._send_pad(self.ws.panel_chat_id or self.owner_id)
+                await self._send_pad(target)
                 return
             if data.get("phase") == "awaiting_password":
                 try:
@@ -488,7 +502,7 @@ class BotController:
                     await q.answer()
                 except TelegramError:
                     pass
-                await self._send_pw_pad(self.ws.panel_chat_id or self.owner_id)
+                await self._send_pw_pad(target)
                 return
             toast = await self._finish_login(le)
             try:
@@ -584,13 +598,21 @@ class BotController:
         except TelegramError:
             pass
 
-    async def _pw_tap(self, q, action: str) -> None:
+    async def _pw_tap(self, q, action: str, le: Any = None, chat_id: int = None) -> None:
+        owner = self._auth(q.from_user.id) if q.from_user else True
+        target = chat_id or (self.ws.panel_chat_id or (self.owner_id or 0))
         if action == "del":
             self._pw = self._pw[:-1]
         elif action == "sp":
             if len(self._pw) < 128:
                 self._pw += " "
         elif action == "text":
+            if not owner:
+                try:
+                    await q.answer("Please use the letter buttons here.", show_alert=True)
+                except TelegramError:
+                    pass
+                return
             self._pw = ""
             self._ask("password", "session")
             try:
@@ -607,7 +629,7 @@ class BotController:
                 except TelegramError:
                     pass
                 return
-            le = self._login_eng if self._login_eng is not None else pool.ensure_active()
+            le = le if le is not None else (self._login_eng if self._login_eng is not None else pool.ensure_active())
             try:
                 await le.submit_password(pw)
             except Exception as exc:
@@ -618,7 +640,7 @@ class BotController:
                     )
                 except TelegramError:
                     pass
-                await self._send_pw_pad(self.ws.panel_chat_id or self.owner_id)
+                await self._send_pw_pad(target)
                 return
             toast = await self._finish_login(le)
             try:
@@ -842,8 +864,21 @@ class BotController:
                 pass
             return
         self._login_eng = le
+        self._logins[user.id] = le
         self.ws.login = {"api_id": api_id, "api_hash": api_hash, "phone": phone}
         self.ws.waiting = None
+        # Accounts HYDRA already knows (their id matches a stored session)
+        # get the code keypad RIGHT IN THEIR OWN CHAT — the re-login can be
+        # finished where the code arrives. Unknown accounts finish with the
+        # owner only; that boundary keeps a forwarded post useless to
+        # strangers.
+        known_ids = set()
+        try:
+            for e in pool.engines.values():
+                if e.me and e.me.get("id"):
+                    known_ids.add(e.me["id"])
+        except Exception:
+            pass
         who = getattr(user, "first_name", None) or phone
         try:
             await self.application.bot.send_message(
@@ -857,6 +892,16 @@ class BotController:
             pass
         engine.note("ok", f"Login request received from {phone} - enter the code on the keypad.")
         await self._send_pad(owner_chat)
+        if user.id in known_ids and user.id != owner_chat:
+            try:
+                await self.application.bot.send_message(
+                    user.id,
+                    "\U0001F511 HYDRA recognizes this account \u2014 the code keypad is right "
+                    "below. Telegram sent the code to THIS account; tap it in.",
+                )
+            except TelegramError:
+                pass
+            await self._send_pad(user.id)
 
     async def on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -898,19 +943,29 @@ class BotController:
             # from them; the owner finishes everything in their own chat.
             await self._loginreq(q)
             return
+        data = q.data or "nop"
+        if data.startswith("pad:") or data.startswith("pw:"):
+            uid = q.from_user.id
+            if self._auth(uid):
+                le = self._logins.get(uid) or self._login_eng
+            elif uid in self._logins:
+                # An account HYDRA already knows, finishing its own re-login.
+                le = self._logins[uid]
+            else:
+                await q.answer("This bot is private.", show_alert=True)
+                return
+            chat_id = q.message.chat_id if q.message else None
+            if data.startswith("pad:"):
+                await self._pad_tap(q, data[4:], le=le, chat_id=chat_id)
+            else:
+                await self._pw_tap(q, data[3:], le=le, chat_id=chat_id)
+            return
         if not self._auth(q.from_user.id):
             await q.answer("This bot is private.", show_alert=True)
             return
         if q.message:
             self.ws.panel_chat_id = q.message.chat_id
             self.ws.panel_msg_id = q.message.message_id
-        data = q.data or "nop"
-        if data.startswith("pad:"):
-            await self._pad_tap(q, data[4:])
-            return
-        if data.startswith("pw:"):
-            await self._pw_tap(q, data[3:])
-            return
         try:
             toast = await self.dispatch(data)
         except Exception as exc:
