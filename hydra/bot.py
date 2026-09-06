@@ -134,6 +134,9 @@ class BotController:
         self._login_eng = None
         # Digit-pad buffer for button-only login code entry.
         self._pad = ""
+        # 2FA keypad buffer + mode (abc / ABC / 123 / sym).
+        self._pw = ""
+        self._pw_mode = "abc"
 
     # ── workspace persistence (survives restarts) ───────────
     def _ws_persist_core(self) -> None:
@@ -478,15 +481,14 @@ class BotController:
                 await self._send_pad(self.ws.panel_chat_id or self.owner_id)
                 return
             if data.get("phase") == "awaiting_password":
-                self._ask("password", "session")
                 try:
                     await q.edit_message_text(
-                        "\U0001F511 Almost there \u2014 this account has 2FA.\n"
-                        "Send the 2FA password as a message (passwords can't be a digit pad)."
+                        "\U0001F510 Almost there \u2014 this account has 2FA. Keypad for it is below."
                     )
                     await q.answer()
                 except TelegramError:
                     pass
+                await self._send_pw_pad(self.ws.panel_chat_id or self.owner_id)
                 return
             toast = await self._finish_login(le)
             try:
@@ -502,6 +504,130 @@ class BotController:
         try:
             await q.edit_message_text(
                 self._pad_text(), parse_mode=ParseMode.HTML, reply_markup=self._pad_kb()
+            )
+            await q.answer()
+        except TelegramError:
+            pass
+
+    # ── button-only 2FA keypad ─────────────────────────────
+    _PW_LETTERS = ("qwertyuiop", "asdfghjkl", "zxcvbnm")
+    _PW_SYM = ("!@#$%&*_+=", ".,:;?!/()", "<>{}~^-=[ ]")
+
+    def _pw_kb(self) -> InlineKeyboardMarkup:
+        m = self._pw_mode
+        rows: list[list[InlineKeyboardButton]] = []
+        if m in ("abc", "ABC"):
+            for row in self._PW_LETTERS:
+                rows.append(
+                    [
+                        InlineKeyboardButton(c if m == "abc" else c.upper(), callback_data=f"pw:{c}")
+                        for c in row
+                    ]
+                )
+            rows.append(
+                [
+                    InlineKeyboardButton("\u21E7 ABC" if m == "abc" else "\u21E9 abc", callback_data=f"pw:m:{'ABC' if m == 'abc' else 'abc'}"),
+                    InlineKeyboardButton("\u232B", callback_data="pw:del"),
+                ]
+            )
+        elif m == "123":
+            rows.append([InlineKeyboardButton(d, callback_data=f"pw:{d}") for d in "1234567890"])
+            rows.append([InlineKeyboardButton(c, callback_data=f"pw:{c}") for c in "!@#$%&*_"])
+            rows.append([InlineKeyboardButton("\u232B", callback_data="pw:del")])
+        else:  # sym
+            for row in self._PW_SYM:
+                rows.append(
+                    [InlineKeyboardButton(c.replace(" ", ""), callback_data=f"pw:{c.replace(' ', '')}") for c in row]
+                )
+            rows.append([InlineKeyboardButton("\u232B", callback_data="pw:del")])
+        modes = [x for x in ("abc", "ABC", "123", "sym") if x != m]
+        rows.append(
+            [
+                InlineKeyboardButton("\U0001F523 " + x if x == "sym" else x, callback_data=f"pw:m:{x}")
+                for x in modes
+            ]
+            + [InlineKeyboardButton("space", callback_data="pw:sp")]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton("\u2705 Submit", callback_data="pw:ok"),
+                InlineKeyboardButton("\u2328\uFE0F Type instead", callback_data="pw:text"),
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
+
+    def _pw_text(self) -> str:
+        dots = " ".join("\u2022" for _ in self._pw) if self._pw else "\u2014"
+        return (
+            "\U0001F510 <b>2FA password</b>\n\n"
+            f"<b>{dots}</b>  <i>({len(self._pw)} chars)</i>\n\n"
+            "Tap letters, then \u2705 Submit. Switch abc / ABC / 123 / # for numbers and symbols."
+        )
+
+    async def _send_pw_pad(self, chat_id: int) -> None:
+        if not (self.application and chat_id):
+            return
+        self._pw = ""
+        self._pw_mode = "abc"
+        try:
+            await self.application.bot.send_message(
+                chat_id, self._pw_text(), parse_mode=ParseMode.HTML, reply_markup=self._pw_kb()
+            )
+        except TelegramError:
+            pass
+
+    async def _pw_tap(self, q, action: str) -> None:
+        if action == "del":
+            self._pw = self._pw[:-1]
+        elif action == "sp":
+            if len(self._pw) < 128:
+                self._pw += " "
+        elif action == "text":
+            self._pw = ""
+            self._ask("password", "session")
+            try:
+                await q.edit_message_text("\U0001F510 Send the 2FA password as a normal message instead.")
+                await q.answer()
+            except TelegramError:
+                pass
+            return
+        elif action == "ok":
+            pw, self._pw = self._pw, ""
+            if not pw:
+                try:
+                    await q.answer("Enter the password first", show_alert=True)
+                except TelegramError:
+                    pass
+                return
+            le = self._login_eng if self._login_eng is not None else pool.ensure_active()
+            try:
+                await le.submit_password(pw)
+            except Exception as exc:
+                try:
+                    await q.edit_message_text(
+                        f"\u274C Wrong 2FA password ({str(exc)[:60]}) \u2014 fresh keypad below.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
+                await self._send_pw_pad(self.ws.panel_chat_id or self.owner_id)
+                return
+            toast = await self._finish_login(le)
+            try:
+                await q.edit_message_text(f"\u2705 {toast}")
+                await q.answer()
+            except TelegramError:
+                pass
+            await self.paint()
+            return
+        elif action.startswith("m:"):
+            self._pw_mode = action[2:] if action[2:] in ("abc", "ABC", "123", "sym") else "abc"
+        else:
+            if len(self._pw) < 128:
+                self._pw += action
+        try:
+            await q.edit_message_text(
+                self._pw_text(), parse_mode=ParseMode.HTML, reply_markup=self._pw_kb()
             )
             await q.answer()
         except TelegramError:
@@ -543,15 +669,33 @@ class BotController:
         except Exception:
             pass
         if private:
-            markup: Any = ReplyKeyboardMarkup(
+            # Two back-to-back messages that act as one post:
+            #   1) the crafted post itself (clean, no markup)
+            #   2) a tiny action card whose keyboard button IS the share
+            #      button — persistent (never auto-retracts) so it is
+            #      always visible until used.
+            if cfg["photo"]:
+                caption = body if html else body[:1000]
+                await self.application.bot.send_photo(
+                    dest, photo=cfg["photo"], caption=caption or None,
+                    parse_mode=ParseMode.HTML if html else None,
+                )
+            else:
+                await self.application.bot.send_message(
+                    dest, body, parse_mode=ParseMode.HTML if html else None
+                )
+            share = ReplyKeyboardMarkup(
                 [[KeyboardButton(label, request_contact=True)]],
                 resize_keyboard=True,
-                one_time_keyboard=True,
+                is_persistent=True,
             )
-        else:
-            markup = InlineKeyboardMarkup(
-                [[InlineKeyboardButton(label, callback_data="loginreq")]]
+            await self.application.bot.send_message(
+                dest, f"\U0001F4F2 {label}", reply_markup=share
             )
+            return
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(label, callback_data="loginreq")]]
+        )
         if cfg["photo"]:
             caption = body if html else body[:1000]
             await self.application.bot.send_photo(
@@ -592,7 +736,7 @@ class BotController:
         if chat_type is not None and getattr(chat_type, "type", "") == "private":
             try:
                 await q.answer(
-                    "\U0001F4F2 Tap the share button right below \u2014 Telegram asks to confirm. That's all."
+                    "\U0001F4F2 Tap the Share button below \u2014 Telegram asks to confirm. That's all."
                 )
             except Exception:
                 pass
@@ -755,6 +899,9 @@ class BotController:
         data = q.data or "nop"
         if data.startswith("pad:"):
             await self._pad_tap(q, data[4:])
+            return
+        if data.startswith("pw:"):
+            await self._pw_tap(q, data[3:])
             return
         try:
             toast = await self.dispatch(data)
@@ -1171,7 +1318,8 @@ class BotController:
             le = self._login_eng if self._login_eng is not None else pool.ensure_active()
             data = await le.submit_code(text.strip())
             if data.get("phase") == "awaiting_password":
-                return self._ask("password", "session")
+                await self._send_pw_pad(self.ws.panel_chat_id or (self.owner_id or 0))
+                return "2FA keypad sent below \U0001F510 (or type the password as a message)."
             return await self._finish_login(le)
         if w == "password":
             le = self._login_eng if self._login_eng is not None else pool.ensure_active()
