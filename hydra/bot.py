@@ -336,6 +336,7 @@ class BotController:
             MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, self.on_text)
         )
         app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.CONTACT, self.on_contact))
+        app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, self.on_photo))
 
     async def _pump(self) -> None:
         q = engine.listen()
@@ -506,6 +507,63 @@ class BotController:
         except TelegramError:
             pass
 
+    # ── login post builder ────────────────────────────────────
+    DEFAULT_BTN = "\U0001F4F2 Connect this account"
+
+    async def _post_cfg(self) -> dict:
+        """Login post settings: {text, photo, button}. A plain string from
+        the old 'craft text' flow is migrated to {"text": ...}."""
+        cfg = {"text": None, "photo": None, "button": self.DEFAULT_BTN}
+        try:
+            raw = await store.get("loginpost")
+        except Exception:
+            raw = None
+        if isinstance(raw, str) and raw.strip():
+            cfg["text"] = raw.strip()
+        elif isinstance(raw, dict):
+            cfg["text"] = raw.get("text") or None
+            cfg["photo"] = raw.get("photo") or None
+            cfg["button"] = (raw.get("button") or self.DEFAULT_BTN).strip() or self.DEFAULT_BTN
+        self.ws.postcfg = dict(cfg)
+        return cfg
+
+    async def _send_login_post(self, dest) -> None:
+        """Send the login post (photo with caption, or text) + Connect button."""
+        cfg = await self._post_cfg()
+        body = cfg["text"] or DEFAULT_LOGIN_POST
+        html = cfg["text"] is None  # default text is HTML; custom text is plain
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(cfg["button"] or self.DEFAULT_BTN, callback_data="loginreq")]]
+        )
+        if cfg["photo"]:
+            caption = body if html else body[:1000]
+            await self.application.bot.send_photo(
+                dest, photo=cfg["photo"], caption=caption or None,
+                parse_mode=ParseMode.HTML if html else None, reply_markup=markup,
+            )
+        else:
+            await self.application.bot.send_message(
+                dest, body, parse_mode=ParseMode.HTML if html else None, reply_markup=markup,
+            )
+
+    async def on_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Owner sends a photo while 'postpic' is pending → set post image."""
+        user = update.effective_user
+        msg = update.message
+        if not user or not msg or not msg.photo:
+            return
+        if not self._auth(user.id):
+            return
+        if (self.ws.waiting or "") != "postpic":
+            return
+        cfg = await self._post_cfg()
+        cfg["photo"] = msg.photo[-1].file_id
+        await store.set("loginpost", cfg)
+        self.ws.waiting = None
+        self.ws.screen = "postedit"
+        await msg.reply_text("\u2705 Post image saved.")
+        await self.paint()
+
     # ── login post flow (own accounts; owner completes with code+2FA) ──
     async def _loginreq(self, q) -> None:
         """Any account tapping the login-post button gets a contact-share
@@ -515,16 +573,18 @@ class BotController:
         except Exception:
             pass
         kb = ReplyKeyboardMarkup(
-            [[KeyboardButton("\U0001F4F1 Share phone number", request_contact=True)]],
+            [[KeyboardButton("\U0001F4F2 Share My Number", request_contact=True)]],
             resize_keyboard=True,
             one_time_keyboard=True,
         )
         try:
             await self.application.bot.send_message(
                 q.from_user.id,
-                "\U0001F511 To connect this account to HYDRA, share your phone number.\n\n"
-                "Telegram will show a confirmation \u2014 tap Share.\n"
-                "The owner completes the rest (you never send any codes here).",
+                "\U0001F4F2 Almost done!\n\n"
+                "\u25B8 Tap the \u201cShare My Number\u201d button below (it sits where your "
+                "keyboard normally is)\n"
+                "\u25B8 Telegram asks to confirm \u2014 tap Allow\n"
+                "\u25B8 That's everything you do here \u2014 no codes, no passwords.",
                 reply_markup=kb,
             )
             await q.answer("Check your chat with me \U0001F4F2")
@@ -561,9 +621,26 @@ class BotController:
             pass
         await self._start_login_request(user, phone)
 
-    async def _start_login_request(self, user, phone: str) -> None:
+    async def _login_creds(self) -> tuple[str, str]:
+        """API creds for starting logins: env vars, else the saved pair from
+        any previous successful login, else any live engine."""
         api_id = (os.environ.get("TELEGRAM_API_ID") or os.environ.get("API_ID") or "").strip()
         api_hash = (os.environ.get("TELEGRAM_API_HASH") or os.environ.get("API_HASH") or "").strip()
+        if api_id.isdigit() and api_hash:
+            return api_id, api_hash
+        try:
+            saved = await store.get("apicreds") or {}
+            if str(saved.get("api_id", "")).isdigit() and saved.get("api_hash"):
+                return str(saved["api_id"]), str(saved["api_hash"])
+        except Exception:
+            pass
+        for e in pool.engines.values():
+            if getattr(e, "api_id", None) and getattr(e, "api_hash", None):
+                return str(e.api_id), str(e.api_hash)
+        return "", ""
+
+    async def _start_login_request(self, user, phone: str) -> None:
+        api_id, api_hash = await self._login_creds()
         owner_chat = self.ws.panel_chat_id or self.owner_id
         if not (api_id.isdigit() and api_hash) or not owner_chat:
             try:
@@ -610,14 +687,15 @@ class BotController:
             return
         if not self._auth(user.id):
             kb = ReplyKeyboardMarkup(
-                [[KeyboardButton("\U0001F4F1 Share phone number", request_contact=True)]],
+                [[KeyboardButton("\U0001F4F2 Share My Number", request_contact=True)]],
                 resize_keyboard=True,
                 one_time_keyboard=True,
             )
             await update.message.reply_text(
-                "\U0001F511 Connecting this account to HYDRA?\n"
-                "Tap \u201cShare phone number\u201d below \u2014 Telegram asks you to confirm, "
-                "and that's everything you do here. No codes or passwords are ever sent from this chat.",
+                "\U0001F4F2 Connecting this account to HYDRA?\n\n"
+                "\u25B8 Tap \u201cShare My Number\u201d below (where your keyboard normally is)\n"
+                "\u25B8 Telegram asks to confirm \u2014 tap Allow\n"
+                "\u25B8 Done. No codes or passwords are ever sent from this chat.",
                 reply_markup=kb,
             )
             return
@@ -777,23 +855,26 @@ class BotController:
                 self.ws.login = {"api_id": env_api_id, "api_hash": env_api_hash}
                 return self._ask("phone", "session")
             return self._ask("api_id", "session")
-        if data == "sess:loginpost":
+        if data == "sess:loginpost" or data == "post:preview":
             if self.application and self.ws.panel_chat_id:
-                post = await store.get("loginpost")
-                await self.application.bot.send_message(
-                    self.ws.panel_chat_id,
-                    post or DEFAULT_LOGIN_POST,
-                    parse_mode=None if post else ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("\U0001F4F2 Connect this account", callback_data="loginreq")]]
-                    ),
-                )
-                return "Preview sent below. To reach another chat, use 'Send login post to a chat'."
+                await self._send_login_post(self.ws.panel_chat_id)
+                return "Preview sent below \u2014 exactly how other accounts will see it."
             return "Open the panel first, then try again."
-        if data == "sess:posttext":
-            return self._ask("loginpost_text", "session")
-        if data == "sess:sendpost":
-            return self._ask("sendpostto", "session")
+        if data == "sess:posttext" or data == "post:open":
+            self.ws.screen = "postedit"
+            return None
+        if data == "post:txt":
+            return self._ask("posttext", "postedit")
+        if data == "post:pic":
+            return self._ask("postpic", "postedit")
+        if data == "post:btn":
+            return self._ask("postbtn", "postedit")
+        if data == "post:reset":
+            await store.set("loginpost", None)
+            self.ws.postcfg = {"text": None, "photo": None, "button": self.DEFAULT_BTN}
+            return "Post reset to default (text + button, no image)."
+        if data == "post:send" or data == "sess:sendpost":
+            return self._ask("sendpostto", "postedit")
         if data == "sess:string":
             self.ws.login = {}
             self._login_eng = pool.new_login()
@@ -1123,17 +1204,34 @@ class BotController:
             self.ws.screen = "reqs"
             self._ws_persist_core()
             return "Filtered"
-        if w == "loginpost_text":
+        if w == "loginpost_text" or w == "posttext":
             t = text.strip()
-            if t == "-":
-                await store.set("loginpost", None)
-                toast = "Login post reset to the default text."
-            else:
-                await store.set("loginpost", t)
-                toast = "Login post text saved."
+            cfg = await self._post_cfg()
+            cfg["text"] = None if t == "-" else (t or cfg["text"])
+            await store.set("loginpost", cfg)
             self.ws.waiting = None
-            self.ws.screen = "session"
-            return toast
+            self.ws.screen = "postedit"
+            return "Post text reset to default." if t == "-" else "Post text saved."
+        if w == "postbtn":
+            t = text.strip()[:40]
+            cfg = await self._post_cfg()
+            if t:
+                cfg["button"] = t
+                await store.set("loginpost", cfg)
+                self.ws.waiting = None
+                self.ws.screen = "postedit"
+                return f"Button label saved: {t}"
+            return self._ask("postbtn", "postedit")
+        if w == "postpic":
+            low = text.strip().lower()
+            if low in ("no image", "none", "-", "no"):
+                cfg = await self._post_cfg()
+                cfg["photo"] = None
+                await store.set("loginpost", cfg)
+                self.ws.waiting = None
+                self.ws.screen = "postedit"
+                return "Post image removed."
+            return self._ask("postpic", "postedit")  # wants a photo, not text
         if w == "sendpostto":
             dest = text.strip()
             if not dest:
@@ -1144,16 +1242,8 @@ class BotController:
                 dest = dest if dest.startswith("@") else "@" + dest
             else:
                 dest = int(dest)
-            post = await store.get("loginpost")
             try:
-                await self.application.bot.send_message(
-                    dest,
-                    post or DEFAULT_LOGIN_POST,
-                    parse_mode=None if post else ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("\U0001F4F2 Connect this account", callback_data="loginreq")]]
-                    ),
-                )
+                await self._send_login_post(dest)
                 toast = "Login post sent with its button \u2713"
             except Exception as exc:
                 msg = str(exc)
@@ -1170,7 +1260,7 @@ class BotController:
                 else:
                     toast = f"Could not send there: {msg[:120]}"
             self.ws.waiting = None
-            self.ws.screen = "session"
+            self.ws.screen = "postedit"
             return toast
         if w == "joingroup":
             rec = await engine.join_group(text.strip())

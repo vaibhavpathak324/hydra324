@@ -718,6 +718,12 @@ class HydraEngine:
         # Mirror session + creds to the state store so restarts can resume
         # (awaited — see persist_session).
         await self.persist_session()
+        # Remember the API creds globally so login-post flows can start
+        # logins even when env vars are not set on the host.
+        if self.api_id and self.api_hash:
+            store.push_soon(
+                "apicreds", {"api_id": self.api_id, "api_hash": self.api_hash}
+            )
         await self._mark_online()
         await self._restore_state()
         self.note("ok", f"Session live as {self.me.get('name') if self.me else '?'}.")

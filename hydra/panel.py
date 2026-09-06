@@ -83,6 +83,7 @@ def render(engine, ws, bot_username: str = "") -> tuple[str, InlineKeyboardMarku
         "job": job,
         "auto": auto_progress,
         "groups": groups,
+        "postedit": postedit,
     }.get(screen, home)
     return fn(engine, ws, bot_username)
 
@@ -133,7 +134,7 @@ def session(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         rows = [
             [B("➕ Add session — phone", "sess:phone")],
             [B("📤 Send login post to a chat", "sess:sendpost")],
-            [B("✍️ Craft login post text", "sess:posttext")],
+            [B("✍️ Edit login post (text · image · button)", "go:postedit")],
             [B("➕ Add — session string", "sess:string")],
             nav(),
         ]
@@ -168,8 +169,8 @@ def session(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "✕ removes it. All sessions stay connected and keep auto-sending.</i>"
     )
     rows.append([B("➕ Add session — phone", "sess:phone")])
+    rows.append([B("✍️ Edit login post (text · image · button)", "go:postedit")])
     rows.append([B("📨 Login post — preview here", "sess:loginpost")])
-    rows.append([B("✍️ Craft login post text", "sess:posttext")])
     rows.append([B("📤 Send login post to a chat", "sess:sendpost")])
     rows.append([B("➕ Add — session string", "sess:string")])
     if engine.phase == "ready":
@@ -370,6 +371,33 @@ def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     return text, kb(rows)
 
 
+def postedit(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Login post builder: text, image, button label, preview, delivery."""
+    cfg = getattr(ws, "postcfg", None) or {"text": None, "photo": None, "button": None}
+    text = cfg.get("text")
+    button = cfg.get("button") or "\U0001F4F2 Connect this account"
+    body = text if text else "📲 Connect this account to HYDRA\n(default text)"
+    lines = [
+        "<b>Login post builder</b>",
+        "",
+        f"<b>Text:</b>\n{preview_msg(body, 260)}",
+        f"<b>Image:</b> {'✅ set' if cfg.get('photo') else '— none (text-only post)'}",
+        f"<b>Button:</b> {esc(str(button))}  <i>(triggers share-contact → you finish the login)</i>",
+        "",
+        "<i>Preview shows exactly what other accounts receive. The button is always "
+        "attached automatically — forwarded copies lose buttons, so deliver via "
+        "'Send to a chat'.</i>",
+    ]
+    rows = [
+        [B("📝 Set text", "post:txt"), B("🖼 Set image", "post:pic")],
+        [B("🔘 Button text", "post:btn")],
+        [B("👁 Preview here", "post:preview"), B("♻️ Reset", "post:reset")],
+        [B("📤 Send to a chat", "post:send")],
+        nav("session"),
+    ]
+    return "\n".join(lines), kb(rows)
+
+
 def groups(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     joins = engine.joins or []
     if joins:
@@ -479,6 +507,9 @@ def wait(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "people_filter": ("Filter people", "", "Send text to match names. Send a single dash (-) to clear."),
         "joingroup": ("Join group", "", "Send the group's @username or t.me link (t.me/+… invites work too)."),
         "loginpost_text": ("Craft login post", "", "Send the text for your login post. Send a single dash (-) to reset to the default."),
+        "posttext": ("Login post · text", "", "Send the post text (emoji, multiple lines — anything). Send a dash (-) to go back to the default text."),
+        "postpic": ("Login post · image", "", "Send the photo to use in the post. Send 'no image' as text to remove the current one."),
+        "postbtn": ("Login post · button", "", f"Send the button label (max 40 chars). Current: {'📲 Connect this account'}"),
         "sendpostto": ("Send login post", "", "Where should the login post go? Send a @username, a t.me/… link, or a numeric chat id. The bot must be able to message that chat."),
     }
     title, step, hint = prompts.get(ws.waiting or "", ("HYDRA", "", "Send your next message."))
