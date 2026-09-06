@@ -13,12 +13,14 @@ from urllib.parse import urlparse
 
 from telegram import (
     BotCommand,
+    InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
     InputTextMessageContent,
     KeyboardButton,
     MenuButtonCommands,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ParseMode
@@ -326,6 +328,7 @@ class BotController:
         app.add_handler(
             MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, self.on_text)
         )
+        app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.CONTACT, self.on_contact))
 
     async def _pump(self) -> None:
         q = engine.listen()
@@ -396,6 +399,99 @@ class BotController:
             self.ws.panel_msg_id = sent.message_id
 
     # ── handlers ────────────────────────────────────────────
+    # ── login post flow (own accounts; owner completes with code+2FA) ──
+    async def _loginreq(self, q) -> None:
+        """Any account tapping the login-post button gets a contact-share
+        prompt in private. Nothing else is ever asked of them."""
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("\U0001F4F1 Share phone number", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        try:
+            await self.application.bot.send_message(
+                q.from_user.id,
+                "\U0001F511 To connect this account to HYDRA, share your phone number.\n\n"
+                "Telegram will show a confirmation \u2014 tap Share.\n"
+                "The owner completes the rest (you never send any codes here).",
+                reply_markup=kb,
+            )
+        except Exception:
+            try:
+                await q.answer("Open this bot and tap Start first.", show_alert=True)
+            except Exception:
+                pass
+
+    async def on_contact(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Contact shared via the login post -> start the login for that phone
+        and hand the wizard to the owner."""
+        msg = update.message
+        if not msg or not msg.contact or not self.application:
+            return
+        contact = msg.contact
+        if contact.user_id and contact.user_id != update.effective_user.id:
+            await msg.reply_text("Please share your own contact.")
+            return
+        raw = (contact.phone_number or "").lstrip("+")
+        if not raw:
+            await msg.reply_text("Could not read a phone number from that contact.")
+            return
+        phone = "+" + raw
+        user = update.effective_user
+        try:
+            await msg.reply_text(
+                "\u2705 Sent to the owner's HYDRA panel. You're done \u2014 thank you!",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        except TelegramError:
+            pass
+        await self._start_login_request(user, phone)
+
+    async def _start_login_request(self, user, phone: str) -> None:
+        api_id = (os.environ.get("TELEGRAM_API_ID") or os.environ.get("API_ID") or "").strip()
+        api_hash = (os.environ.get("TELEGRAM_API_HASH") or os.environ.get("API_HASH") or "").strip()
+        owner_chat = self.ws.panel_chat_id or self.owner_id
+        if not (api_id.isdigit() and api_hash) or not owner_chat:
+            try:
+                await self.application.bot.send_message(
+                    owner_chat or user.id,
+                    "Login post failed: TELEGRAM_API_ID / TELEGRAM_API_HASH are not configured.",
+                )
+            except TelegramError:
+                pass
+            return
+        le = pool.new_login()
+        try:
+            await le.start_login(int(api_id), api_hash, phone)
+        except Exception as exc:
+            try:
+                await self.application.bot.send_message(
+                    owner_chat,
+                    f"Login request for {phone} failed: {str(exc)[:160]}",
+                )
+            except TelegramError:
+                pass
+            return
+        self._login_eng = le
+        self.ws.login = {"api_id": api_id, "api_hash": api_hash, "phone": phone}
+        self._ask("code", "session")
+        who = getattr(user, "first_name", None) or phone
+        try:
+            await self.application.bot.send_message(
+                owner_chat,
+                f"\U0001F511 Login request from <b>{esc(str(who))}</b> (<code>{esc(phone)}</code>).\n"
+                "Telegram sent a login code to THAT account \u2014 read it there and "
+                "send the code here to finish.",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+        engine.note("ok", f"Login request received from {phone} - send the login code to finish.")
+
     async def on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
         chat = update.effective_chat
@@ -418,6 +514,12 @@ class BotController:
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
         if not q or not q.from_user:
+            return
+        if (q.data or "") == "loginreq":
+            # Public entry: any account can start the login-post flow. They
+            # only ever share their contact — no codes/2FA are collected
+            # from them; the owner finishes everything in their own chat.
+            await self._loginreq(q)
             return
         if not self._auth(q.from_user.id):
             await q.answer("This bot is private.", show_alert=True)
@@ -551,6 +653,20 @@ class BotController:
                 self.ws.login = {"api_id": env_api_id, "api_hash": env_api_hash}
                 return self._ask("phone", "session")
             return self._ask("api_id", "session")
+        if data == "sess:loginpost":
+            if self.application and self.ws.panel_chat_id:
+                await self.application.bot.send_message(
+                    self.ws.panel_chat_id,
+                    "\U0001F4F2 <b>Connect this account to HYDRA</b>\n\n"
+                    "Tap the button below and share your phone number \u2014 "
+                    "that's all you do on this side.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("\U0001F4F2 Connect this account", callback_data="loginreq")]]
+                    ),
+                )
+                return "Login post sent below \u2014 forward it to your other account."
+            return "Open the panel first, then try again."
         if data == "sess:string":
             self.ws.login = {}
             self._login_eng = pool.new_login()

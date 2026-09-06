@@ -128,6 +128,7 @@ def session(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         )
         rows = [
             [B("➕ Add session — phone", "sess:phone")],
+            [B("📨 Login post — easy add", "sess:loginpost")],
             [B("➕ Add — session string", "sess:string")],
             nav(),
         ]
@@ -155,6 +156,7 @@ def session(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "✕ removes it. All sessions stay connected and keep auto-sending.</i>"
     )
     rows.append([B("➕ Add session — phone", "sess:phone")])
+    rows.append([B("📨 Login post — easy add", "sess:loginpost")])
     rows.append([B("➕ Add — session string", "sess:string")])
     if engine.phase == "ready":
         rows.append([B("Export active session", "sess:export")])
