@@ -1156,7 +1156,19 @@ class BotController:
                 )
                 toast = "Login post sent with its button \u2713"
             except Exception as exc:
-                toast = f"Could not send there: {str(exc)[:120]}"
+                msg = str(exc)
+                low = msg.lower()
+                uname = "@" + (self.username or "hydra324bot").lstrip("@")
+                if "chat not found" in low or "not found" in low:
+                    toast = (
+                        "Couldn't reach that chat. For a DM, that account must open "
+                        f"{uname} and press Start once \u2014 then I can DM them the login "
+                        "post. (Channels/groups work if the bot is a member/admin there.)"
+                    )
+                elif "blocked" in low:
+                    toast = f"That account blocked the bot \u2014 unblock {uname} first."
+                else:
+                    toast = f"Could not send there: {msg[:120]}"
             self.ws.waiting = None
             self.ws.screen = "session"
             return toast

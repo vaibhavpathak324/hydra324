@@ -58,6 +58,10 @@ def session_line(engine) -> str:
         return "○ waiting for login code"
     if engine.phase == "awaiting_password":
         return "○ waiting for 2FA password"
+    if engine.phase == "dead_key":
+        return "⚠️ saved — needs re-login"
+    if engine.phase == "waiting":
+        return "🔄 reconnecting…"
     return "○ no session"
 
 
@@ -142,6 +146,13 @@ def session(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         who = me.get("username") or me.get("name") or me.get("phone") or s["key"]
         mark = "●" if s["active"] else "○"
         extra = []
+        st = s.get("phase")
+        if st == "dead_key":
+            extra.append("⚠️ needs re-login")
+        elif st == "waiting":
+            extra.append("🔄 reconnecting")
+        elif st not in ("ready", "awaiting_code", "awaiting_password"):
+            extra.append("logged out")
         if s.get("auto"):
             extra.append("auto")
         if s.get("armed"):

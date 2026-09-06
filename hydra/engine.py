@@ -254,6 +254,29 @@ class HydraEngine:
             return None
         return self.client.session.save()
 
+    async def persist_session(self, force: bool = True) -> bool:
+        """Write the session string + creds to the state store under THIS
+        engine's final key. Awaited, never fire-and-forget — the session
+        string is the most valuable state in the system; a dropped
+        fire-and-forget write is exactly how sessions used to vanish."""
+        if not self.client:
+            return False
+        try:
+            raw = self.client.session.save()
+        except Exception:
+            return False
+        if not raw:
+            return False
+        if not force and raw == getattr(self, "_last_persisted", None):
+            return True
+        await store.set(self._k("session"), raw)
+        await store.set(
+            self._k("creds"),
+            {"api_id": self.api_id, "api_hash": self.api_hash, "phone": self.phone},
+        )
+        self._last_persisted = raw
+        return True
+
     async def try_resume(self) -> bool:
         """Restore the saved session. Returns True when the session is live.
 
@@ -286,23 +309,31 @@ class HydraEngine:
                     self.note("ok", "Resumed existing session.")
                     await self._restore_state()
                     return True
-                # Genuinely unauthorized (revoked/logged out elsewhere)
+                # Genuinely unauthorized (revoked/logged out elsewhere).
+                # KEEP the stored copy (never delete user state) — mark the
+                # engine so the panel shows it as needing re-login and the
+                # watchdog does not retry-loop.
                 await self.client.disconnect()
                 self.client = None
-                self.phase = "logged_out"
-                self.note("warn", "Session is no longer authorized — log in again.")
+                self.phase = "dead_key"
+                self.note(
+                    "warn",
+                    "This login is no longer valid on Telegram. The saved session is "
+                    "kept — log in again to replace it (Sessions → Add session).",
+                )
                 return False
             except Exception as exc:
                 if "used under two different IP" in str(exc) or type(exc).__name__ == "AuthKeyDuplicatedError":
-                    # Permanently dead key (Telegram invalidated it) — stop
-                    # retrying and clear it so the watchdog doesn't loop.
+                    # Permanently dead key (Telegram invalidated it). Stop
+                    # retrying, but NEVER delete the stored session — the
+                    # row stays visible in the panel marked for re-login.
+                    self.phase = "dead_key"
                     self.note(
                         "warn",
-                        "Session invalidated by Telegram (the same login was used from "
-                        "two places). Log in again: Sessions → Add session.",
+                        "Telegram invalidated this login (the same login was used from "
+                        "two places). The saved session is kept — log in again to "
+                        "replace it (Sessions → Add session).",
                     )
-                    store.push_soon(self._k("session"), None)
-                    store.push_soon(self._k("creds"), None)
                     return False
                 self.note(
                     "warn",
@@ -684,13 +715,9 @@ class HydraEngine:
 
     async def _after_sign_in(self) -> None:
         self._write_session_string()
-        # Mirror session + creds to the state store so restarts can resume.
-        if store.enabled() and self.client:
-            store.push_soon(
-                "creds",
-                {"api_id": self.api_id, "api_hash": self.api_hash, "phone": self.phone},
-            )
-            store.push_soon(self._k("session"), self.client.session.save())
+        # Mirror session + creds to the state store so restarts can resume
+        # (awaited — see persist_session).
+        await self.persist_session()
         await self._mark_online()
         await self._restore_state()
         self.note("ok", f"Session live as {self.me.get('name') if self.me else '?'}.")
@@ -1536,13 +1563,22 @@ class EnginePool:
             self._hb_task = asyncio.create_task(self._hb_loop(), name="hydra-locks-hb")
 
     async def _hb_loop(self) -> None:
+        beats = 0
         while True:
             await asyncio.sleep(30)
+            beats += 1
             for k in list(self.engines.keys()):
                 try:
                     lock = await store.get(f"lock:{k}") or {}
                     if lock.get("id") == self.inst_id:
                         await store.set(f"lock:{k}", {"id": self.inst_id, "ts": time.time()})
+                    # Self-heal the most important state in the system: if a
+                    # session write ever got lost, re-assert it (no-op when
+                    # unchanged). Every ~5 minutes per session.
+                    if beats % 10 == 0:
+                        e = self.engines.get(k)
+                        if e is not None and e.client and e.phase == "ready":
+                            await e.persist_session(force=False)
                 except Exception:
                     pass
 
@@ -1625,6 +1661,13 @@ class EnginePool:
         eng.session_path = DATA / f"session-{key}.string"
         eng._write_creds()
         eng._write_session_string()
+        # CRITICAL: the login happened on the temp engine, so the session
+        # string currently lives only in memory / ephemeral disk / a temp
+        # store row that gets purged below. Persist it under the FINAL key
+        # right here, awaited — this is the write that makes sessions
+        # survive restarts.
+        await eng.persist_session()
+        self._heartbeat()  # keep this engine's lock fresh from now on
         store.push_soon(eng._k("armed_uid"), (me or {}).get("id"))
         store.push_soon(eng._k("armed"), [])
         store.push_soon(eng._k("sent"), {"uid": (me or {}).get("id"), "ids": []})
@@ -1704,30 +1747,75 @@ class EnginePool:
             except Exception:
                 pass
 
+    async def _stored(self, eng: "HydraEngine") -> bool:
+        """True when a session exists on disk or in the state store."""
+        if eng.session_path.exists() and eng.creds_path.exists():
+            return True
+        try:
+            return bool(await store.get(eng._k("session")))
+        except Exception:
+            return False
+
+    def _spawn_resume(self, key: str, eng: "HydraEngine") -> None:
+        """Background reconnect for a session that could not resume at boot —
+        usually because the previous instance still held the session lock
+        during a deploy. Keeps the session visible in the panel meanwhile."""
+
+        async def _retry() -> None:
+            for _ in range(30):  # keep trying for ~30 minutes
+                await asyncio.sleep(60)
+                if eng.phase == "ready" or key not in self.engines:
+                    return
+                try:
+                    if not await self._claim_lock(key, timeout=10.0):
+                        continue
+                    try:
+                        await eng.try_resume()
+                    except Exception:
+                        pass
+                    if eng.phase == "ready":
+                        eng.start_background()
+                        eng.note("ok", "Session reconnected automatically.")
+                        return
+                    await self._release_lock(key)
+                except Exception:
+                    pass
+
+        try:
+            loop = asyncio.get_running_loop()
+            if not hasattr(self, "_resume_tasks"):
+                self._resume_tasks: set = set()
+            t = loop.create_task(_retry(), name=f"hydra-resume-{key}")
+            self._resume_tasks.add(t)
+            t.add_done_callback(self._resume_tasks.discard)
+        except RuntimeError:
+            pass
+
     async def bootstrap(self) -> None:
-        """Restore every stored session at boot (legacy data becomes 'main')."""
+        """Restore every stored session at boot (legacy data becomes 'main').
+
+        Sessions that cannot resume yet (lock held by the previous instance,
+        transient network failure) are still REGISTERED so they never vanish
+        from the Sessions screen; a background retry reconnects them as soon
+        as the lock frees up. The lock wait here is short so boot never
+        stalls behind a slow draining instance.
+        """
         meta = await store.get("pool") or {}
         keys = list(meta.get("keys") or [])
-        main = HydraEngine("main")
-        if await self._claim_lock("main"):
-            await main.try_resume()
-            if main.phase != "ready":
-                await self._release_lock("main")
-        if main.phase == "ready":
-            self._register("main", main, make_active=(meta.get("active") == "main"))
-        for k in keys:
-            if k == "main":
-                continue
+        for k in ["main"] + [x for x in keys if x != "main"]:
             e = HydraEngine(k)
-            if await self._claim_lock(k):
+            if await self._claim_lock(k, timeout=20.0):
                 try:
                     await e.try_resume()
                 except Exception:
                     pass
                 if e.phase != "ready":
                     await self._release_lock(k)
-            if e.phase == "ready":
+            if e.phase == "ready" or await self._stored(e):
                 self._register(k, e, make_active=(meta.get("active") == k))
+                if e.phase not in ("ready", "dead_key"):
+                    e.phase = "waiting"
+                    self._spawn_resume(k, e)
         if self.active_key is None and self.order:
             self.active_key = self.order[0]
             self.persist_meta()
