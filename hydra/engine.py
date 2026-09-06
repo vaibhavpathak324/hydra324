@@ -158,6 +158,8 @@ class HydraEngine:
         # Everyone this account has ever DMed, with access hashes — the
         # broadcast list (persisted, account-bound).
         self.dmdir: dict[int, dict[str, Any]] = {}
+        # Groups joined through the bot (persisted) — group broadcast list.
+        self.joins: list[dict[str, Any]] = []
         # Auto-send job state (persisted): keeps DMing the unsent selection.
         self.auto: dict[str, Any] = {}
         self._auto_task: Optional[asyncio.Task] = None
@@ -339,6 +341,10 @@ class HydraEngine:
         except Exception:
             self.sent_ids = set()
         try:
+            self.joins = list(await store.get(self._k("joins")) or [])
+        except Exception:
+            self.joins = []
+        try:
             d = await store.get(self._k("dir")) or {}
             if d.get("uid") and self.me and d["uid"] == self.me.get("id"):
                 self.dmdir = {int(k): v for k, v in (d.get("dir") or {}).items()}
@@ -405,15 +411,13 @@ class HydraEngine:
         self.note("ok", f"Cleared DM history ({n} records). Those people can be DMed again.")
         return n
 
-    # ── auto-send ───────────────────────────────────────────
+    # ── auto DMs (continuous) ────────────────────────────────
     def auto_status(self) -> dict[str, Any]:
         a = self.auto or {}
         on = bool(a.get("on"))
         return {
             "on": on,
-            "interval": int(a.get("interval", 30) or 30),
             "remaining": len(self._auto_remaining()) if on else 0,
-            "next_in": max(0, int((a.get("next") or 0) - time.time())) if on else 0,
         }
 
     def _auto_remaining(self) -> list[dict[str, Any]]:
@@ -437,18 +441,14 @@ class HydraEngine:
         chat_id: int,
         people: list[dict[str, Any]],
         message: str,
-        interval: Optional[int] = None,
         title: Optional[str] = None,
     ) -> None:
-        interval = int(interval or (self.auto or {}).get("interval") or 30)
         self.auto = {
             "on": True,
             "chat_id": int(chat_id),
             "title": title or "",
             "people": list(people),
             "message": message,
-            "interval": interval,
-            "next": time.time() + 10,
             "passes": 0,
             "sent_total": 0,
             "last_result": "",
@@ -457,30 +457,23 @@ class HydraEngine:
         self._ensure_auto_loop()
         self.note(
             "ok",
-            f"Auto-send ON — {len(self._auto_remaining())} to DM, one pass every {interval}s.",
+            f"Auto DMs ON — {len(self._auto_remaining())} to DM, sending continuously until done.",
         )
         self.emit("status", **self.snapshot())
 
     async def auto_stop(self) -> None:
-        self.auto = {"on": False, "interval": (self.auto or {}).get("interval", 30)}
+        self.auto = {"on": False}
         store.push_soon(self._k("auto"), self.auto)
-        self.note("ok", "Auto-send stopped.")
+        self.note("ok", "Auto DMs stopped.")
         self.emit("status", **self.snapshot())
-
-    def auto_set_interval(self, seconds: int) -> None:
-        a = dict(self.auto or {})
-        a["interval"] = max(3, min(120, int(seconds)))
-        a.setdefault("on", False)
-        self.auto = a
-        store.push_soon(self._k("auto"), a)
 
     async def _auto_loop(self) -> None:
         while True:
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             try:
                 await self._auto_tick()
             except Exception as exc:
-                self.note("warn", f"Auto-send check failed: {_err_name(exc)}")
+                self.note("warn", f"Auto DM check failed: {_err_name(exc)}")
 
     async def _auto_tick(self, force: bool = False) -> None:
         a = self.auto or {}
@@ -492,21 +485,19 @@ class HydraEngine:
         if j and j.status == "running":
             if time.time() - getattr(j, "touched", 0) > 120:
                 j.status = "done"
-                j.detail = "Recovered an interrupted job — auto-send continues."
+                j.detail = "Recovered an interrupted job — auto DMs continue."
                 self.note("warn", j.detail)
                 self.emit("job", job=j.as_dict())
             else:
                 return  # genuinely still sending
-        if not force and time.time() < (a.get("next") or 0):
-            return
         remaining = self._auto_remaining()
         if not remaining:
-            self.auto = {"on": False, "interval": a.get("interval", 30)}
+            self.auto = {"on": False}
             store.push_soon(self._k("auto"), self.auto)
-            self.note("ok", "Auto-send finished — everyone in the selection has been DMed. ✅")
+            self.note("ok", "Auto DMs finished — everyone in the selection has been DMed. ✅")
             self.emit("status", **self.snapshot())
             return
-        self.note("ok", f"Auto-send pass {int(a.get('passes', 0)) + 1}: {len(remaining)} unsent, sending.")
+        self.note("ok", f"Auto DM pass {int(a.get('passes', 0)) + 1}: {len(remaining)} unsent, sending.")
         passes = int(a.get("passes", 0)) + 1
         sent_total = int(a.get("sent_total", 0))
         try:
@@ -520,29 +511,116 @@ class HydraEngine:
                 self.auto = {**a, "on": False}
                 store.push_soon(self._k("auto"), self.auto)
                 self.note(
-                    "ok", "Auto-send finished — the rest can't be DMed (unreachable)."
+                    "ok", "Auto DMs finished — the rest can't be DMed (unreachable)."
                 )
                 self.emit("status", **self.snapshot())
                 return
             last = f"pass failed: {_err_name(exc)}"
-            self.note("warn", f"Auto-send pass: {_err_name(exc)}")
+            self.note("warn", f"Auto DM pass: {_err_name(exc)}")
         a = dict(a)
-        a.update(
-            {
-                "passes": passes,
-                "sent_total": sent_total,
-                "last_result": last,
-                "next": time.time() + int(a.get("interval", 30) or 30),
-            }
-        )
+        a.update({"passes": passes, "sent_total": sent_total, "last_result": last})
         self.auto = a
         store.push_soon(self._k("auto"), a)
         self.emit("status", **self.snapshot())
+        # No interval: the next loop tick (2s) starts the next pass — the
+        # only pacing is Telegram's own flood window.
 
     async def auto_force_pass(self) -> None:
-        """Run an auto-send pass immediately (Auto progress → Send a pass now)."""
+        """Run an auto-DM pass immediately."""
         if (self.auto or {}).get("on"):
             await self._auto_tick(force=True)
+
+    # ── group joining + group broadcast ──────────────────────
+    async def join_group(self, identifier: str) -> dict[str, Any]:
+        """Join a public group/channel by @username or t.me link, or a private
+        one by invite link (t.me/+hash). remembers it for group broadcasts."""
+        client = self._need()
+        await self.ensure_connected()
+        ident = identifier.strip()
+        if "/" in ident:
+            ident = ident.split("/")[-1] or ident
+        entity = None
+        if ident.startswith("+") or ident.startswith("joinchat/"):
+            hash_ = ident.lstrip("+").replace("joinchat/", "")
+            if not hash_:
+                raise RuntimeError("That invite link looks incomplete.")
+            from telethon.tl.functions.messages import ImportChatInviteRequest
+
+            updates = await client(ImportChatInviteRequest(hash_))
+            chats = getattr(updates, "chats", []) or []
+            if chats:
+                entity = chats[0]
+        else:
+            username = ident.lstrip("@")
+            if not username:
+                raise RuntimeError("Send a @username or a t.me link.")
+            from telethon.tl.functions.channels import JoinChannelRequest
+
+            await client(JoinChannelRequest(username))
+            entity = await client.get_entity(username)
+        if entity is None:
+            raise RuntimeError("Joined, but could not read the chat details.")
+        rec = {
+            "id": int(entity.id),
+            "title": getattr(entity, "title", None) or ident,
+            "username": getattr(entity, "username", None),
+            "access_hash": str(int(getattr(entity, "access_hash", 0) or 0)),
+        }
+        if not rec["access_hash"]:
+            try:
+                full = await client.get_input_entity(rec["id"])
+                rec["access_hash"] = str(int(getattr(full, "access_hash", 0) or 0))
+            except Exception:
+                pass
+        joins = [j for j in self.joins if j["id"] != rec["id"]]
+        joins.append(rec)
+        self.joins = joins
+        store.push_soon(self._k("joins"), joins)
+        self.note("ok", f"Joined and saved: {rec['title']}")
+        return rec
+
+    def remove_join(self, chat_id: int) -> None:
+        self.joins = [j for j in self.joins if int(j["id"]) != int(chat_id)]
+        store.push_soon(self._k("joins"), self.joins)
+
+    async def broadcast_groups(self, message: str) -> dict[str, Any]:
+        """Send the message to every joined group/channel (as the session)."""
+        async with self._job_lock:
+            text = message.strip()
+            if not text:
+                raise RuntimeError("Message is empty. Set it on the Message screen.")
+            client = self._need()
+            await self.ensure_connected()
+            targets = [j for j in self.joins if int(j.get("access_hash") or 0)]
+            if not targets:
+                raise RuntimeError("No groups yet — Groups → Join group first.")
+            job = Job(id=f"gbcast-{int(time.time())}", kind="group broadcast", total=len(targets))
+            self.job = job
+            self.emit("job", job=job.as_dict())
+            self.note("ok", f"Broadcasting to {len(targets)} groups.")
+            requests = []
+            from telethon.tl.types import InputPeerChannel
+
+            for t in targets:
+                requests.append(
+                    SendMessageRequest(
+                        peer=InputPeerChannel(
+                            channel_id=int(t["id"]), access_hash=int(t["access_hash"])
+                        ),
+                        message=text,
+                        random_id=random.randrange(1, 2**63),
+                        no_webpage=True,
+                    )
+                )
+            await self._burst(requests, job, "group broadcast", [t["id"] for t in targets])
+            job.status = "done" if job.status != "cancelled" else job.status
+            job.detail = f"Groups messaged {job.ok} · failed {job.fail}"
+            if job.skipped:
+                job.detail += f" · {job.skipped} skipped (flood — run again later)"
+            self.emit("job", job=job.as_dict())
+            self.emit("status", **self.snapshot())
+            self.note("ok", job.detail)
+            return {"job": job.as_dict()}
 
     # ── auth ────────────────────────────────────────────────
     async def start_login(self, api_id: int, api_hash: str, phone: str) -> dict[str, Any]:
@@ -1427,6 +1505,55 @@ class EnginePool:
         self.engines: dict[str, HydraEngine] = {}
         self.order: list[str] = []
         self.active_key: Optional[str] = None
+        import uuid
+
+        self.inst_id = uuid.uuid4().hex[:12]
+        self._hb_task: Optional[asyncio.Task] = None
+
+    # ── session locks: never connect one session from two instances ──
+    # Render deploys overlap old/new instances; Telegram invalidates keys
+    # used from two IPs at once. The new instance waits for the old one to
+    # release (heartbeat goes stale) before connecting.
+    async def _claim_lock(self, skey: str, timeout: float = 180.0) -> bool:
+        key = f"lock:{skey}"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            lock = await store.get(key)
+            stale = (not lock) or (time.time() - float(lock.get("ts") or 0) > 75)
+            if stale:
+                await store.set(key, {"id": self.inst_id, "ts": time.time()})
+                return True
+            await asyncio.sleep(5)
+        return False
+
+    async def _release_lock(self, skey: str) -> None:
+        lock = await store.get(f"lock:{skey}") or {}
+        if not lock or lock.get("id") == self.inst_id:
+            await store.set(f"lock:{skey}", None)
+
+    def _heartbeat(self) -> None:
+        if self._hb_task is None or self._hb_task.done():
+            self._hb_task = asyncio.create_task(self._hb_loop(), name="hydra-locks-hb")
+
+    async def _hb_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            for k in list(self.engines.keys()):
+                try:
+                    lock = await store.get(f"lock:{k}") or {}
+                    if lock.get("id") == self.inst_id:
+                        await store.set(f"lock:{k}", {"id": self.inst_id, "ts": time.time()})
+                except Exception:
+                    pass
+
+    async def release_all(self) -> None:
+        if self._hb_task:
+            self._hb_task.cancel()
+        for k in list(self.engines.keys()):
+            try:
+                await self._release_lock(k)
+            except Exception:
+                pass
 
     # ── roster ───────────────────────────────────────────────
     def _register(self, key: str, eng: HydraEngine, make_active: bool = True) -> None:
@@ -1582,22 +1709,30 @@ class EnginePool:
         meta = await store.get("pool") or {}
         keys = list(meta.get("keys") or [])
         main = HydraEngine("main")
-        await main.try_resume()
+        if await self._claim_lock("main"):
+            await main.try_resume()
+            if main.phase != "ready":
+                await self._release_lock("main")
         if main.phase == "ready":
             self._register("main", main, make_active=(meta.get("active") == "main"))
         for k in keys:
             if k == "main":
                 continue
             e = HydraEngine(k)
-            try:
-                await e.try_resume()
-            except Exception:
-                pass
+            if await self._claim_lock(k):
+                try:
+                    await e.try_resume()
+                except Exception:
+                    pass
+                if e.phase != "ready":
+                    await self._release_lock(k)
             if e.phase == "ready":
                 self._register(k, e, make_active=(meta.get("active") == k))
         if self.active_key is None and self.order:
             self.active_key = self.order[0]
             self.persist_meta()
+        if self.engines:
+            self._heartbeat()
 
 
 class _EngineProxy:

@@ -590,8 +590,6 @@ class BotController:
             return self._confirm("logout")
         if data == "act:clrsent":
             return self._confirm("clrsent")
-        if data == "act:autoint":
-            return self._ask("autoint", "act")
         if data == "act:bcast":
             if not engine.dmdir:
                 return "No known recipients yet — DM some people first."
@@ -635,6 +633,19 @@ class BotController:
             await engine.auto_stop()
             self.ws.screen = "auto"
             return "Stopped."
+        if data == "act:joingroup":
+            return self._ask("joingroup", "groups")
+        if data == "act:gbcast":
+            if not engine.joins:
+                return "No groups yet — join one first."
+            if not self.ws.message.strip():
+                return "Set the message first (Message)."
+            return self._confirm("gbcast")
+        if data.startswith("grm:"):
+            jid = int(data.split(":", 1)[1])
+            engine.remove_join(jid)
+            self.ws.screen = "groups"
+            return "Removed."
 
         if data == "chats:load":
             return await self._load_chats()
@@ -759,6 +770,7 @@ class BotController:
             "do:logout": self._run_logout,
             "do:clrsent": self._run_clr_sent,
             "do:bcast": self._run_bcast,
+            "do:gbcast": self._run_gbcast,
             "do:sesrm": self._run_rm_session,
             "do:postinline": self._run_post_inline,
             "do:postsession": self._run_post_session,
@@ -867,15 +879,11 @@ class BotController:
             self.ws.screen = "reqs"
             self._ws_persist_core()
             return "Filtered"
-        if w == "autoint":
-            try:
-                n = max(3, min(120, int(text.strip())))
-            except ValueError:
-                return self._ask("autoint", "act")
-            engine.auto_set_interval(n)
+        if w == "joingroup":
+            rec = await engine.join_group(text.strip())
             self.ws.waiting = None
-            self.ws.screen = "act"
-            return f"Auto-send interval: every {n}s"
+            self.ws.screen = "groups"
+            return f"Joined {rec.get('title') or 'group'}"
         return None
 
     async def _load_chats(self) -> str:
@@ -962,6 +970,9 @@ class BotController:
 
     async def _run_bcast(self) -> None:
         await engine.broadcast(self.ws.message.strip())
+
+    async def _run_gbcast(self) -> None:
+        await engine.broadcast_groups(self.ws.message.strip())
 
     async def _run_rm_session(self) -> None:
         key = str(self.ws.login.pop("_rmkey", "") or "")

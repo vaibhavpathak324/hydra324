@@ -78,6 +78,7 @@ def render(engine, ws, bot_username: str = "") -> tuple[str, InlineKeyboardMarku
         "confirm": confirm,
         "job": job,
         "auto": auto_progress,
+        "groups": groups,
     }.get(screen, home)
     return fn(engine, ws, bot_username)
 
@@ -299,14 +300,15 @@ def auto_progress(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMar
     elif a.get("last_result"):
         prog = f"\n\nLast pass: <b>{esc(str(a['last_result']))}</b>"
     text = (
-        "<b>Auto-send · ON</b>\n"
+        "<b>Auto DMs · ON</b>\n"
         f"Chat: {esc(str(a.get('title') or a.get('chat_id') or '—'))}\n\n"
         f"Sent so far: <b>{int(a.get('sent_total', 0) or 0)}</b>\n"
         f"Still unsent: <b>{st['remaining']}</b>\n"
         f"Passes done: <b>{int(a.get('passes', 0) or 0)}</b>\n"
-        f"Interval: every {st['interval']}s · next pass in ~{max(1, st['next_in'])}s"
+        "Mode: continuous — no pauses"
         f"{prog}\n\n"
-        "<i>Runs until everyone is DMed or you stop it. Nobody gets two DMs.</i>"
+        "<i>Sends back-to-back until everyone is DMed or you stop it. "
+        "Nobody gets two DMs.</i>"
     )
     rows = [
         [B("⏹ Stop auto-send", "auto:stop")],
@@ -345,11 +347,40 @@ def actions(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     rows = [
         main,
         [B("📊 Progress", "go:auto")],
-        [B(f"⏱ Speed · every {auto['interval']}s", "act:autoint")],
+        [B("👥 Groups · join & broadcast", "go:groups")],
         [B("📢 Broadcast to all known DMs", "act:bcast")],
         nav(),
     ]
     return text, kb(rows)
+
+
+def groups(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    joins = engine.joins or []
+    if joins:
+        head = "<b>Groups</b>\n\n" + "\n".join(
+            f"• {esc(str(j.get('title') or j.get('id')))}" for j in joins
+        )
+        head += "\n\n<i>Broadcast to groups sends the current message to all of them as the session.</i>"
+    else:
+        head = (
+            "<b>Groups</b>\n\n"
+            "No groups joined yet.\n\n"
+            "Join a group with its @username or t.me invite link — "
+            "then broadcast to all of them with one tap."
+        )
+    rows: list[list[InlineKeyboardButton]] = []
+    for j in joins:
+        rows.append(
+            [
+                B(str(j.get("title") or j.get("id"))[:56], "nop"),
+                B("✕", f"grm:{j['id']}"),
+            ]
+        )
+    rows.append([B("➕ Join group", "act:joingroup")])
+    if joins:
+        rows.append([B("📣 Broadcast to groups", "act:gbcast")])
+    rows.append(nav())
+    return head, kb(rows)
 
 
 def post(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -430,7 +461,7 @@ def wait(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
         "btn_url": ("Add button", "2 / 2 · URL", "Send the URL, including https://"),
         "chat_filter": ("Filter chats", "", "Send text to match titles. Send a single dash (-) to clear."),
         "people_filter": ("Filter people", "", "Send text to match names. Send a single dash (-) to clear."),
-        "autoint": ("Auto-send interval", "", "Send the seconds between automatic passes (3–120)."),
+        "joingroup": ("Join group", "", "Send the group's @username or t.me link (t.me/+… invites work too)."),
     }
     title, step, hint = prompts.get(ws.waiting or "", ("HYDRA", "", "Send your next message."))
     step_l = f"\n{esc(step)}\n" if step else "\n"
@@ -454,6 +485,12 @@ def confirm(engine, ws, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
             "recipients — everyone this account has ever DMed. They get it even "
             "if they were DMed before.",
             "do:bcast",
+        ),
+        "gbcast": (
+            "📣 Broadcast to groups",
+            f"Send the current message to <b>all {len(engine.joins)}</b> joined "
+            "groups/channels, as the session.",
+            "do:gbcast",
         ),
         "sesrm": (
             "Remove session",

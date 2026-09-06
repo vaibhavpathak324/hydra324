@@ -39,6 +39,7 @@ async def lifespan(app: FastAPI):
         await controller.stop()
     except Exception:
         pass
+    await pool.release_all()
     if getattr(pool, "_heal_task", None):
         pool._heal_task.cancel()
     for eng in pool.engines.values():
